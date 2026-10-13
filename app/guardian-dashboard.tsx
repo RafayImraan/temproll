@@ -3,10 +3,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import Image from 'next/image';
 import Link from 'next/link';
-import { createPublicClient, createWalletClient, custom, formatUnits, http, isAddress, keccak256, parseEventLogs, parseUnits, stringToHex, type EIP1193Provider } from 'viem';
+import { createPublicClient, createWalletClient, custom, formatUnits, http, isAddress, parseEventLogs, parseUnits, type EIP1193Provider } from 'viem';
 import { sepolia } from 'viem/chains';
-import { createVerifiedRegistrySchedule, registryErrorMessage, switchToSepolia, validateScheduleInput } from '@/lib/registry-flow.mjs';
-import { classifyPaymentFailure, demoTokenAbi, explainPreflight, guardianAbi, readGuardianSnapshot } from '@/lib/guardian-flow.mjs';
+import { switchToSepolia } from '@/lib/registry-flow.mjs';
+import { canRefreshGuardian, classifyPaymentFailure, demoTokenAbi, explainPreflight, guardianAbi, readGuardianSnapshot } from '@/lib/guardian-flow.mjs';
 import 'viem/window';
 
 type Schedule = {
@@ -34,11 +34,8 @@ type Snapshot = {
   payments: Payment[];
 };
 type Attempt = { id: string; kind: string; status: 'flagged' | 'blocked' | 'failed'; detail: string; createdAt: string; hash?: `0x${string}`; scheduleId?: string };
-type RegistryResult = { status: 'pending' | 'success' | 'failure'; hash?: `0x${string}`; message: string };
-
 const paymentsAddress = process.env.NEXT_PUBLIC_RECURRING_PAYMENTS_ADDRESS;
 const tokenAddress = process.env.NEXT_PUBLIC_TEST_PAYROLL_TOKEN_ADDRESS;
-const registryAddress = process.env.NEXT_PUBLIC_PAYROLL_REGISTRY_ADDRESS;
 const rpcUrl = process.env.NEXT_PUBLIC_SEPOLIA_RPC_URL || sepolia.rpcUrls.default.http[0];
 const explorerUrl = (process.env.NEXT_PUBLIC_SEPOLIA_EXPLORER_URL || sepolia.blockExplorers.default.url).replace(/\/$/, '');
 const startBlock = /^\d+$/.test(process.env.NEXT_PUBLIC_GUARDIAN_DEPLOYMENT_BLOCK || '') ? BigInt(process.env.NEXT_PUBLIC_GUARDIAN_DEPLOYMENT_BLOCK!) : 0n;
@@ -63,7 +60,7 @@ function chainError(error: unknown) {
   if (raw.includes('approvalrequired')) return 'Employer approval is required before this payment can execute.';
   if (raw.includes('notdue')) return 'This installment is not due yet.';
   if (raw.includes('insufficienttokenbalance')) return 'The payment contract does not have enough test tokens.';
-  return 'The contract rejected the request. Review the Guardian check and wallet network.';
+  return 'The contract rejected the request. Check the rules and wallet network.';
 }
 
 export default function GuardianDashboard() {
@@ -87,14 +84,28 @@ export default function GuardianDashboard() {
   const [mintAmount, setMintAmount] = useState('1000');
   const [fundAmount, setFundAmount] = useState('500');
   const [selectedCheck, setSelectedCheck] = useState<Record<string, ReturnType<typeof explainPreflight>>>({});
-  const [registryRecipient, setRegistryRecipient] = useState('');
-  const [registryCadence, setRegistryCadence] = useState(2592000);
-  const [registryResult, setRegistryResult] = useState<RegistryResult | null>(null);
 
   const guardianConfigured = !!paymentsAddress && isAddress(paymentsAddress) && !!tokenAddress && isAddress(tokenAddress);
   const connectedToSepolia = chainId === sepolia.id;
   const isOwner = !!snapshot && !!wallet && snapshot.owner.toLowerCase() === wallet.toLowerCase();
   const isExecutor = !!snapshot && !!wallet && snapshot.executor.toLowerCase() === wallet.toLowerCase();
+  const scheduleBlockReason = !wallet
+    ? 'Connect the contract owner wallet.'
+    : !connectedToSepolia
+      ? 'Switch the wallet to Sepolia.'
+      : !snapshot
+        ? 'Waiting for contract data.'
+        : !isOwner
+          ? 'The connected wallet is not the contract owner.'
+          : !snapshot.policy[4]
+            ? 'Configure the payment policy first.'
+            : !isAddress(recipient)
+              ? 'Enter a recipient address.'
+              : recipientAllowed !== true
+                ? 'Allow this recipient first.'
+                : busy
+                  ? `${busy}...`
+                  : '';
 
   const recordAttempt = useCallback((entry: Omit<Attempt, 'id' | 'createdAt'>) => {
     const record: Attempt = { ...entry, id: crypto.randomUUID(), createdAt: new Date().toISOString() };
@@ -195,7 +206,7 @@ export default function GuardianDashboard() {
 
   async function sendGuardianCall(label: string, functionName: string, args: readonly unknown[]) {
     if (!wallet || !connectedToSepolia) throw new Error('Connect the employer wallet on Sepolia first.');
-    if (!guardianConfigured) throw new Error('Set the Guardian contract and test token addresses in .env.local.');
+    if (!guardianConfigured) throw new Error('Sepolia payment contracts are not configured.');
     setBusy(label);
     let hash: `0x${string}` | undefined;
     try {
@@ -219,7 +230,7 @@ export default function GuardianDashboard() {
 
   async function configurePolicy(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!snapshot?.decimals) { setLoadMessage('Guardian contracts are not ready.'); return; }
+    if (!snapshot?.decimals) { setLoadMessage('Payment contracts are not ready.'); return; }
     try {
       const max = parseUnits(maxPerPayment, snapshot.decimals);
       const daily = parseUnits(dailyLimit, snapshot.decimals);
@@ -341,28 +352,9 @@ export default function GuardianDashboard() {
     } finally { setBusy(''); }
   }
 
-  async function createRegistryMetadata(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!registryAddress || !isAddress(registryAddress)) { setRegistryResult({ status: 'failure', message: 'Registry address is not configured.' }); return; }
-    const invalid = validateScheduleInput(registryRecipient, registryCadence);
-    if (invalid) { setRegistryResult({ status: 'failure', message: invalid }); return; }
-    const provider = window.ethereum;
-    if (!provider) { setRegistryResult({ status: 'failure', message: 'Connect the employer wallet on Sepolia.' }); return; }
-    try {
-      const client = createWalletClient({ chain: sepolia, transport: custom(provider as EIP1193Provider) });
-      const publicClientForRegistry = createPublicClient({ chain: sepolia, transport: http(rpcUrl) });
-      const scheduleId = keccak256(stringToHex(crypto.randomUUID()));
-      const result = await createVerifiedRegistrySchedule({ walletClient: client, publicClient: publicClientForRegistry, registryAddress: registryAddress as `0x${string}`, employeeAddress: registryRecipient as `0x${string}`, cadenceSeconds: registryCadence, scheduleId, nowSeconds: Math.floor(Date.now() / 1000), onSubmitted: (submitted) => setRegistryResult({ status: 'pending', hash: (submitted as { hash: `0x${string}` }).hash, message: 'Waiting for Sepolia confirmation.' }) }) as { hash: `0x${string}`; blockNumber: bigint };
-      setRegistryResult({ status: 'success', hash: result.hash, message: `Verified in block ${result.blockNumber}. Metadata only; no payment sent.` });
-    } catch (error) { setRegistryResult((current) => ({ status: 'failure', hash: current?.hash, message: registryErrorMessage(error) })); }
-  }
-
   const scheduleIds = new Set(snapshot?.schedules.map((schedule) => schedule.id) || []);
   const payments = snapshot?.payments.filter((payment) => scheduleIds.has(payment.id)) || [];
   const confirmedPaymentHashes = new Set(payments.map((payment) => payment.hash.toLowerCase()));
-  const blockedCount = attempts.filter((item) => item.status === 'blocked').length;
-  const failedCount = attempts.filter((item) => item.status === 'failed').length;
-  const flaggedCount = attempts.filter((item) => item.status === 'flagged' && item.kind === 'Security check').length;
   const latestHistory = [
     ...payments.map((payment) => ({ source: 'Sepolia', title: `Schedule #${payment.id} · installment ${payment.installment + 1}`, detail: `${formatAmount(payment.amount, snapshot?.decimals)} TROLL · ${short(payment.recipient)}`, hash: payment.hash, sort: Number(payment.blockNumber), type: 'onchain' })),
     ...attempts
@@ -379,22 +371,18 @@ export default function GuardianDashboard() {
     </header>
     <div className="app-content guardian-content">
       {walletMessage && <p className="notice" role="status">{walletMessage}</p>}
-      <div className="guardian-title"><div><h1>Payroll Guardian</h1><p>Check payroll rules before a test-token payment.</p></div><button className="button" onClick={() => void refresh()} disabled={loading || !wallet}>{loading ? 'Refreshing…' : 'Refresh'}</button></div>
+      <div className="guardian-title"><div><h1>Payroll</h1></div><button className="button" onClick={() => void refresh()} disabled={!canRefreshGuardian({ loading, hasWallet: !!wallet, configured: guardianConfigured })}>{loading ? 'Refreshing...' : 'Refresh'}</button></div>
 
-      {!guardianConfigured && <div className="notice" role="status">Guardian contracts are not configured. Deploy the test contracts, then add their public addresses to .env.local.</div>}
+      {!guardianConfigured && <div className="notice" role="status">Sepolia payment contracts are not configured.</div>}
       {loadMessage && <p className="action-message" role="status">{loadMessage}</p>}
 
-      <section className="guardian-stats" aria-label="Payment activity counts">
-        <div><strong>{payments.length}</strong><span>Verified payments</span></div><div><strong>{flaggedCount}</strong><span>Flagged checks</span></div><div><strong>{blockedCount}</strong><span>Blocked attempts</span></div><div><strong>{failedCount}</strong><span>Failed actions</span></div>
-      </section>
-
+      {guardianConfigured && <>
       <section className="guardian-section">
         <div className="section-title"><h2>Policy</h2><span>{snapshot?.policy[4] ? 'Configured on Sepolia' : 'Not configured'}</span></div>
-        <p className="section-copy">Limits are enforced by the payment contract. The demo token has no monetary value.</p>
         <form className="policy-form" onSubmit={configurePolicy}>
           <label>Max per payment <span>TROLL</span><input type="number" min="0.000000000000000001" step="any" value={maxPerPayment} onChange={(e) => setMaxPerPayment(e.target.value)} /></label>
           <label>Daily limit <span>TROLL</span><input type="number" min="0.000000000000000001" step="any" value={dailyLimit} onChange={(e) => setDailyLimit(e.target.value)} /></label>
-          <label>Approval from <span>TROLL · 0 disables</span><input type="number" min="0" step="any" value={approvalThreshold} onChange={(e) => setApprovalThreshold(e.target.value)} /></label>
+          <label>Approval threshold <span>TROLL; 0 disables</span><input type="number" min="0" step="any" value={approvalThreshold} onChange={(e) => setApprovalThreshold(e.target.value)} /></label>
           <label>Recipient cooldown <span>seconds</span><input type="number" min="0" step="1" value={recipientCooldown} onChange={(e) => setRecipientCooldown(e.target.value)} /></label>
           <button className="button button-primary" type="submit" disabled={!isOwner || !connectedToSepolia || !!busy}>{busy === 'Policy update' ? 'Saving…' : 'Save policy'}</button>
         </form>
@@ -402,31 +390,32 @@ export default function GuardianDashboard() {
       </section>
 
       <section className="guardian-section">
-        <div className="section-title"><h2>Employee access</h2><span>{recipientAllowed === true ? 'Allowed on Sepolia' : recipientAllowed === false ? 'Not allowed' : ''}</span></div>
-        <div className="inline-form"><label>Employee wallet address<input value={recipient} onChange={(e) => setRecipient(e.target.value)} autoComplete="off" spellCheck={false} /></label><button className="button" onClick={() => void changeRecipientAccess(true)} disabled={!isOwner || !connectedToSepolia || !!busy || !isAddress(recipient)}>Allow</button><button className="button button-danger" onClick={() => void changeRecipientAccess(false)} disabled={!isOwner || !connectedToSepolia || !!busy || !isAddress(recipient)}>Remove</button></div>
-      </section>
-
-      <section className="guardian-section">
-        <div className="section-title"><h2>Create payment schedule</h2><span>Manual execution</span></div>
-        <p className="section-copy">First installment is scheduled two minutes after creation. The executor must run it manually when due.</p>
+        <div className="section-title"><h2>New schedule</h2></div>
         <form className="schedule-form" onSubmit={createRecurringSchedule}>
           <label>Recipient<input value={recipient} onChange={(e) => setRecipient(e.target.value)} required pattern="0x[a-fA-F0-9]{40}" autoComplete="off" spellCheck={false} /></label>
           <label>Amount <span>TROLL</span><input type="number" min="0.000000000000000001" step="any" value={amount} onChange={(e) => setAmount(e.target.value)} required /></label>
           <label>Frequency<select value={cadence} onChange={(e) => setCadence(Number(e.target.value))}>{cadenceOptions.map((option) => <option value={option.seconds} key={option.seconds}>{option.label}</option>)}</select></label>
-          <button className="button button-primary" type="submit" disabled={!isOwner || !connectedToSepolia || !snapshot?.policy[4] || recipientAllowed !== true || !!busy}>{busy === 'Creating schedule' ? 'Creating…' : 'Create schedule'}</button>
+          <div className="schedule-access">
+            <button className="button" type="button" onClick={() => void changeRecipientAccess(true)} disabled={!isOwner || !connectedToSepolia || !!busy || !isAddress(recipient)}>Allow recipient</button>
+            <button className="button button-danger" type="button" onClick={() => void changeRecipientAccess(false)} disabled={!isOwner || !connectedToSepolia || !!busy || !isAddress(recipient)}>Remove access</button>
+            <span>{recipientAllowed === true ? 'Allowed on Sepolia' : recipientAllowed === false ? 'Not allowed' : isAddress(recipient) ? 'Checking access...' : 'Enter a recipient'}</span>
+          </div>
+          <button className="button button-primary" type="submit" disabled={!!scheduleBlockReason}>{busy === 'Creating schedule' ? 'Creating...' : 'Create schedule'}</button>
         </form>
+        {scheduleBlockReason && <p className="footnote" role="status">{scheduleBlockReason}</p>}
+        <p className="footnote">Installments are executed manually when due.</p>
       </section>
 
       <section className="guardian-section">
-        <div className="section-title"><h2>Test token</h2><span>TROLL · Sepolia only</span></div>
+        <div className="section-title"><h2>TROLL token</h2><span>No monetary value · Sepolia</span></div>
         <div className="token-actions">
-          <form onSubmit={(e) => void tokenAction('mint', e)}><label>Mint to connected wallet<input type="number" min="0.000000000000000001" step="any" value={mintAmount} onChange={(e) => setMintAmount(e.target.value)} /></label><button className="button" disabled={!isOwner || !connectedToSepolia || !!busy}>Mint test tokens</button></form>
-          <form onSubmit={(e) => void tokenAction('fund', e)}><label>Send to payment contract<input type="number" min="0.000000000000000001" step="any" value={fundAmount} onChange={(e) => setFundAmount(e.target.value)} /></label><button className="button" disabled={!isOwner || !connectedToSepolia || !!busy}>Fund contract</button></form>
+          <form onSubmit={(e) => void tokenAction('mint', e)}><label>Mint to wallet<input type="number" min="0.000000000000000001" step="any" value={mintAmount} onChange={(e) => setMintAmount(e.target.value)} /></label><button className="button" disabled={!isOwner || !connectedToSepolia || !!busy}>{busy === 'Minting test tokens' ? 'Minting...' : 'Mint'}</button></form>
+          <form onSubmit={(e) => void tokenAction('fund', e)}><label>Fund payment contract<input type="number" min="0.000000000000000001" step="any" value={fundAmount} onChange={(e) => setFundAmount(e.target.value)} /></label><button className="button" disabled={!isOwner || !connectedToSepolia || !!busy}>{busy === 'Funding payment contract' ? 'Funding...' : 'Fund'}</button></form>
         </div>
       </section>
 
       <section className="guardian-section">
-        <div className="section-title"><h2>Schedules</h2><button className="text-button" onClick={() => void refresh()} disabled={loading}>Refresh chain records</button></div>
+        <div className="section-title"><h2>Schedules</h2></div>
         {!wallet && <p className="empty-state">Connect the employer wallet to load its schedules.</p>}
         {wallet && snapshot?.schedules.length === 0 && <p className="empty-state">No schedules found for this wallet.</p>}
         <div className="schedule-cards">{snapshot?.schedules.map((schedule) => {
@@ -435,7 +424,7 @@ export default function GuardianDashboard() {
             <div className="payment-top"><div><strong>Schedule #{schedule.id}</strong><span>{short(schedule.recipient)} · {formatAmount(schedule.amount, snapshot.decimals)} TROLL · {cadenceOptions.find((item) => item.seconds === Number(schedule.interval))?.label || `${schedule.interval}s`}</span></div><span className={`risk-level ${assessment.level.toLowerCase()}`}>{assessment.level} · {assessment.score}</span></div>
             <div className="risk-details"><b>{assessment.action.replace('_', ' ')}</b>{assessment.reasons.length ? <ul>{assessment.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul> : <span>No policy flags.</span>}</div>
             <div className="payment-bottom"><span>{schedule.active ? `Due ${new Date(Number(schedule.nextDue) * 1000).toLocaleString()}` : 'Inactive'} · installment {schedule.executions + 1}</span><div>
-              <button className="text-button" onClick={() => void runSecurityCheck(schedule)} disabled={!!busy}>Run Security Check</button>
+              <button className="text-button" onClick={() => void runSecurityCheck(schedule)} disabled={!!busy}>Check rules</button>
               {assessment.action === 'REQUIRE_APPROVAL' && isOwner && <button className="text-button" onClick={() => void approvePayment(schedule)} disabled={!!busy}>Approve</button>}
               {assessment.action === 'ALLOW' && <button className="text-button" onClick={() => void executePayment(schedule)} disabled={!isExecutor || !connectedToSepolia || !!busy}>Execute payment</button>}
             </div></div>
@@ -444,14 +433,12 @@ export default function GuardianDashboard() {
       </section>
 
       <section className="guardian-section">
-        <div className="section-title"><h2>Recent activity</h2><span>Chain events and local checks</span></div>
+        <div className="section-title"><h2>Activity</h2><span>{payments.length} confirmed payments</span></div>
         {latestHistory.length === 0 ? <p className="empty-state">No activity yet.</p> : <div className="activity-list">{latestHistory.map((item, index) => <div className="activity-row" key={`${item.type}-${item.hash || item.sort}-${index}`}><div><strong>{item.title}</strong><span>{item.detail}</span></div><small>{item.source}</small>{item.hash && <a href={`${explorerUrl}/tx/${item.hash}`} target="_blank" rel="noreferrer">Etherscan ↗</a>}</div>)}</div>}
-        <p className="footnote">Payment events are read from Sepolia. Preflight checks and failed local actions are stored in this browser only.</p>
+        <p className="footnote">Sepolia transactions are public. Checks without a transaction are saved in this browser.</p>
       </section>
 
-      <p className="privacy-note">On-chain: recipient, token, amount, timing, policy changes, and payment events. Local only: risk-check history. TROLL is a test token with no monetary value.</p>
-
-      <details className="registry-tools"><summary>Schedule metadata registry</summary><p>Optional registry entry for public cadence metadata. It does not transfer tokens.</p><form onSubmit={createRegistryMetadata}><label>Employee address<input value={registryRecipient} onChange={(e) => setRegistryRecipient(e.target.value)} required pattern="0x[a-fA-F0-9]{40}" /></label><label>Cadence<select value={registryCadence} onChange={(e) => setRegistryCadence(Number(e.target.value))}>{cadenceOptions.map((option) => <option value={option.seconds} key={option.seconds}>{option.label}</option>)}</select></label><button className="button" type="submit" disabled={!connectedToSepolia || registryResult?.status === 'pending'}>Register metadata</button></form>{registryResult && <div className={`registry-result ${registryResult.status}`}>{registryResult.message}{registryResult.hash && <a href={`${explorerUrl}/tx/${registryResult.hash}`} target="_blank" rel="noreferrer">View on Etherscan ↗</a>}</div>}</details>
+      </>}
     </div>
   </main>;
 }

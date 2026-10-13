@@ -8,6 +8,33 @@ import { sepolia } from 'viem/chains';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const rpcUrl = process.env.SEPOLIA_RPC_URL?.trim();
 const privateKey = process.env.SEPOLIA_DEPLOYER_PRIVATE_KEY?.trim();
+let deploymentPhase = 'configuration validation';
+let deploymentProgress = 'No deployment transaction has been submitted.';
+
+function safeFailure(error) {
+  const item = error && typeof error === 'object' ? error : {};
+  const raw = `${item.name || ''} ${item.shortMessage || ''} ${item.details || ''} ${item.message || error || ''} ${item.cause?.name || ''} ${item.cause?.shortMessage || ''} ${item.cause?.message || ''}`;
+  const lower = raw.toLowerCase();
+  let category = 'deployment/runtime';
+  if (lower.includes('set sepolia_rpc_url') || lower.includes('set a valid test-only sepolia_deployer_private_key')) category = 'configuration';
+  else if (lower.includes('insufficient funds') || lower.includes('insufficient balance')) category = 'insufficient Sepolia ETH';
+  else if (lower.includes('private key') || lower.includes('invalid account')) category = 'deployer key';
+  else if (lower.includes('chain') && (lower.includes('expected') || lower.includes('returned'))) category = 'wrong RPC network';
+  else if (lower.includes('artifact') || lower.includes('bytecode') || lower.includes('solc')) category = 'compiler artifact';
+  else if (lower.includes('receipt') || lower.includes('timed out') || lower.includes('timeout')) category = 'transaction receipt';
+  else if (lower.includes('post-deployment check')) category = 'deployment readback';
+  else if (lower.includes('request') || lower.includes('rpc') || lower.includes('fetch') || lower.includes('http')) category = 'RPC/network request';
+
+  const message = raw
+    .replace(/https?:\/\/[^\s)"']+/gi, '[RPC URL redacted]')
+    .replace(/0x[a-fA-F0-9]{64}/g, '[64-hex value redacted]')
+    .replace(/\b[a-fA-F0-9]{64}\b/g, '[64-hex value redacted]')
+    .replace(/(api[_ -]?key|token|authorization|private[_ -]?key)(\s*[=:]\s*)[^\s,;]+/gi, '$1$2[redacted]')
+    .replace(/\bBearer\s+\S+/gi, 'Bearer [redacted]')
+    .replace(/[\r\n]+/g, ' ')
+    .slice(0, 500);
+  return { category, message: message || 'No safe error message was available.' };
+}
 
 async function artifact(name) {
   try { return JSON.parse(await readFile(resolve(root, `contracts/artifacts/${name}.json`), 'utf8')); }
@@ -17,10 +44,13 @@ async function artifact(name) {
 async function deploy(publicClient, walletClient, account, name, args = []) {
   const contract = await artifact(name);
   if (!contract.abi || !/^0x[0-9a-fA-F]+$/.test(contract.bytecode || '')) throw new Error(`Invalid ${name} compilation artifact.`);
+  deploymentProgress = `${name}: deployment request is being sent; submission status is not yet known.`;
   const hash = await walletClient.deployContract({ abi: contract.abi, bytecode: contract.bytecode, args, account });
+  deploymentProgress = `${name}: transaction submitted with hash ${hash}.`;
   process.stdout.write(`${name} deployment transaction: ${hash}\n`);
   const receipt = await publicClient.waitForTransactionReceipt({ hash, timeout: 120_000 });
   if (receipt.status !== 'success' || !receipt.contractAddress) throw new Error(`${name} deployment did not produce a successful contract receipt.`);
+  deploymentProgress = `${name}: receipt confirmed at ${receipt.contractAddress}.`;
   const code = await publicClient.getBytecode({ address: receipt.contractAddress });
   if (!code || code === '0x') throw new Error(`${name} has no bytecode at its receipt address.`);
   process.stdout.write(`${name} address: ${receipt.contractAddress}\nExplorer: https://sepolia.etherscan.io/address/${receipt.contractAddress}\n`);
@@ -40,12 +70,16 @@ async function main() {
   if (!/^0x[0-9a-fA-F]{64}$/.test(privateKey || '')) throw new Error('Set a valid test-only SEPOLIA_DEPLOYER_PRIVATE_KEY in the local shell.');
   const account = privateKeyToAccount(privateKey);
   const publicClient = createPublicClient({ chain: sepolia, transport: http(rpcUrl, { timeout: 30_000 }) });
+  deploymentPhase = 'Sepolia RPC chain ID check';
   const chainId = await publicClient.getChainId();
   if (chainId !== sepolia.id) throw new Error(`RPC returned chain ${chainId}; refusing to deploy outside Sepolia.`);
   const walletClient = createWalletClient({ account, chain: sepolia, transport: http(rpcUrl, { timeout: 30_000 }) });
   process.stdout.write(`Deploying test-only Guardian contracts to Sepolia from ${account.address}. Test token has no monetary value.\n`);
+  deploymentPhase = 'TestPayrollToken deployment';
   const token = await deploy(publicClient, walletClient, account, 'TestPayrollToken');
+  deploymentPhase = 'RecurringPayments deployment';
   const payments = await deploy(publicClient, walletClient, account, 'RecurringPayments', [account.address]);
+  deploymentPhase = 'post-deployment readback';
   await verifyDeployment(publicClient, 'TestPayrollToken', token.address, [
     ['owner', [], account.address],
     ['symbol', [], 'TROLL'],
@@ -64,7 +98,10 @@ async function main() {
   process.stdout.write(`\nSet these public values in project-root .env.local:\nNEXT_PUBLIC_TEST_PAYROLL_TOKEN_ADDRESS=${token.address}\nNEXT_PUBLIC_RECURRING_PAYMENTS_ADDRESS=${payments.address}\nNEXT_PUBLIC_GUARDIAN_DEPLOYMENT_BLOCK=${payments.blockNumber}\n`);
 }
 
-main().catch(() => {
-  process.stderr.write('Guardian deployment failed. Check local Sepolia RPC, test wallet configuration, test ETH, compiler artifacts, and transaction receipts. No secret values are printed.\n');
+main().catch((error) => {
+  const safe = safeFailure(error);
+  process.stderr.write(`Guardian deployment failed [${safe.category}] during ${deploymentPhase}: ${safe.message}\n`);
+  process.stderr.write(`Deployment progress: ${deploymentProgress}\n`);
+  process.stderr.write('RPC URLs, private keys, and environment values are not printed.\n');
   process.exitCode = 1;
 });
