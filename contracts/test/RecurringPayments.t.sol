@@ -33,6 +33,29 @@ contract RecurringPaymentsTest is Test {
     function createDue(uint128 amount) internal returns (uint256) {
         return payments.createSchedule(vendor, address(token), amount, amount, uint64(block.timestamp + 1), 30 days, 0);
     }
+    function testOnlyAuthorizedEmployersCanCreateSchedules() public {
+        address employer = address(0xE2);
+        vm.prank(employer);
+        vm.expectRevert(RecurringPayments.Unauthorized.selector);
+        payments.createSchedule(vendor, address(token), 10, 10, uint64(block.timestamp + 1), 30 days, 0);
+        assertEq(payments.nextScheduleId(), 1);
+        assertEq(token.balanceOf(vendor), 0);
+
+        payments.setEmployerAuthorized(employer, true);
+        assertTrue(payments.authorizedEmployers(employer));
+        vm.prank(employer);
+        uint256 id = payments.createSchedule(vendor, address(token), 10, 10, uint64(block.timestamp + 1), 30 days, 0);
+        (address scheduleOwner,,,,,,,,,) = payments.schedules(id);
+        assertEq(scheduleOwner, employer);
+    }
+
+    function testOnlyOwnerCanAuthorizeEmployers() public {
+        vm.prank(address(0xBAD));
+        vm.expectRevert(RecurringPayments.Unauthorized.selector);
+        payments.setEmployerAuthorized(address(0xE2), true);
+        assertFalse(payments.authorizedEmployers(address(0xE2)));
+    }
+
     function testExecuteDueAndAdvance() public {
         uint256 id = createDue(50);
         vm.warp(block.timestamp + 1);

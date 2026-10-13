@@ -4,6 +4,8 @@ Temproll is a Sepolia hackathon demo for payroll policy checks. The Guardian con
 
 The payment executor is manual. There is no keeper or automatic settlement. `TROLL` is a demo-only token with no monetary value. Schedule data, recipients, policies, and transfers are public on Sepolia. The older `PayrollScheduleRegistry` records schedule metadata only and remains a separate contract. Noir proof generation/verification is not connected to this flow.
 
+Only authorized employers can create schedules. The deploying owner is authorized at construction; the owner may grant or revoke other employers with `setEmployerAuthorized`. An employer can approve only installments belonging to its own schedules.
+
 ## Run locally
 
 ```powershell

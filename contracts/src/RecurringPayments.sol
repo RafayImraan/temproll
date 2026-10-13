@@ -63,6 +63,7 @@ contract RecurringPayments {
     bool public paused;
     uint256 public nextScheduleId = 1;
     uint256 private lockState = 1;
+    mapping(address => bool) public authorizedEmployers;
     mapping(uint256 => Schedule) public schedules;
     mapping(uint256 => mapping(uint32 => bool)) public executed;
     mapping(uint256 => address) public pendingRecipients;
@@ -73,6 +74,7 @@ contract RecurringPayments {
     mapping(uint256 => mapping(uint32 => bytes32)) public paymentApprovals;
 
     event ExecutorUpdated(address indexed executor);
+    event EmployerAuthorizationUpdated(address indexed employer, bool authorized);
     event Paused(address indexed by);
     event Unpaused(address indexed by);
     event RecipientApprovalUpdated(address indexed recipient, bool allowed);
@@ -87,12 +89,20 @@ contract RecurringPayments {
 
     modifier onlyOwner() { if (msg.sender != owner) revert Unauthorized(); _; }
     modifier onlyExecutor() { if (msg.sender != executor) revert Unauthorized(); _; }
+    modifier onlyAuthorizedEmployer() { if (!authorizedEmployers[msg.sender]) revert Unauthorized(); _; }
     modifier nonReentrant() { if (lockState != 1) revert ReentrantCall(); lockState = 2; _; lockState = 1; }
 
     constructor(address initialExecutor) {
         if (initialExecutor == address(0)) revert InvalidSchedule();
         owner = msg.sender;
         executor = initialExecutor;
+        authorizedEmployers[msg.sender] = true;
+    }
+
+    function setEmployerAuthorized(address employer, bool authorized) external onlyOwner {
+        if (employer == address(0)) revert InvalidSchedule();
+        authorizedEmployers[employer] = authorized;
+        emit EmployerAuthorizationUpdated(employer, authorized);
     }
 
     function setExecutor(address next) external onlyOwner {
@@ -116,7 +126,7 @@ contract RecurringPayments {
     function pause() external onlyOwner { paused = true; emit Paused(msg.sender); }
     function unpause() external onlyOwner { paused = false; emit Unpaused(msg.sender); }
 
-    function createSchedule(address recipient, address token, uint128 amount, uint128 maxPerPayment, uint64 firstDue, uint64 interval, uint64 endAt) external returns (uint256 id) {
+    function createSchedule(address recipient, address token, uint128 amount, uint128 maxPerPayment, uint64 firstDue, uint64 interval, uint64 endAt) external onlyAuthorizedEmployer returns (uint256 id) {
         TokenPolicy memory policy = tokenPolicies[token];
         if (recipient == address(0) || token == address(0) || amount == 0 || maxPerPayment < amount || interval == 0 || firstDue <= block.timestamp || (endAt != 0 && endAt < firstDue) || !policy.configured) revert InvalidSchedule();
         if (!approvedRecipients[recipient]) revert RecipientNotAllowed();
@@ -174,8 +184,9 @@ contract RecurringPayments {
     }
 
     /// @notice Employer approval commits to the current exact recipient, amount, due time and installment.
-    function approvePayment(uint256 id) external onlyOwner {
+    function approvePayment(uint256 id) external {
         Schedule storage s = schedules[id];
+        if (s.owner != msg.sender) revert Unauthorized();
         if (!s.active) revert Inactive();
         if (pendingRecipients[id] != address(0)) revert RecipientChangePending();
         TokenPolicy memory policy = tokenPolicies[s.token];
