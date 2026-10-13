@@ -27,6 +27,14 @@ async function deploy(publicClient, walletClient, account, name, args = []) {
   return { address: receipt.contractAddress, blockNumber: receipt.blockNumber };
 }
 
+async function verifyDeployment(publicClient, artifactName, address, checks) {
+  const contract = await artifact(artifactName);
+  for (const [functionName, args, expected] of checks) {
+    const actual = await publicClient.readContract({ address, abi: contract.abi, functionName, args });
+    if (actual !== expected) throw new Error(`${artifactName} post-deployment check failed for ${functionName}.`);
+  }
+}
+
 async function main() {
   if (!rpcUrl) throw new Error('Set SEPOLIA_RPC_URL in the local shell.');
   if (!/^0x[0-9a-fA-F]{64}$/.test(privateKey || '')) throw new Error('Set a valid test-only SEPOLIA_DEPLOYER_PRIVATE_KEY in the local shell.');
@@ -38,6 +46,21 @@ async function main() {
   process.stdout.write(`Deploying test-only Guardian contracts to Sepolia from ${account.address}. Test token has no monetary value.\n`);
   const token = await deploy(publicClient, walletClient, account, 'TestPayrollToken');
   const payments = await deploy(publicClient, walletClient, account, 'RecurringPayments', [account.address]);
+  await verifyDeployment(publicClient, 'TestPayrollToken', token.address, [
+    ['owner', [], account.address],
+    ['symbol', [], 'TROLL'],
+    ['decimals', [], 18],
+    ['totalSupply', [], 0n],
+    ['balanceOf', [payments.address], 0n],
+  ]);
+  await verifyDeployment(publicClient, 'RecurringPayments', payments.address, [
+    ['owner', [], account.address],
+    ['executor', [], account.address],
+    ['authorizedEmployers', [account.address], true],
+    ['paused', [], false],
+    ['nextScheduleId', [], 1n],
+  ]);
+  process.stdout.write('Deployment state verified: token owner/symbol/decimals/empty supply and Guardian owner/executor/employer authorization/unpaused state.\n');
   process.stdout.write(`\nSet these public values in project-root .env.local:\nNEXT_PUBLIC_TEST_PAYROLL_TOKEN_ADDRESS=${token.address}\nNEXT_PUBLIC_RECURRING_PAYMENTS_ADDRESS=${payments.address}\nNEXT_PUBLIC_GUARDIAN_DEPLOYMENT_BLOCK=${payments.blockNumber}\n`);
 }
 

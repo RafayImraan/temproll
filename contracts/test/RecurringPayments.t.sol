@@ -56,6 +56,23 @@ contract RecurringPaymentsTest is Test {
         assertFalse(payments.authorizedEmployers(address(0xE2)));
     }
 
+    function testOnlyScheduleEmployerCanApproveItsInstallment() public {
+        address employer = address(0xE2);
+        payments.setEmployerAuthorized(employer, true);
+        payments.setTokenPolicy(address(token), 1000, 2000, 20, 1 days);
+        vm.prank(employer);
+        uint256 id = payments.createSchedule(vendor, address(token), 25, 25, uint64(block.timestamp + 1), 30 days, 0);
+
+        vm.expectRevert(RecurringPayments.Unauthorized.selector);
+        payments.approvePayment(id);
+        vm.prank(address(0xBAD));
+        vm.expectRevert(RecurringPayments.Unauthorized.selector);
+        payments.approvePayment(id);
+        vm.prank(employer);
+        payments.approvePayment(id);
+        assertNotEq(payments.paymentApprovals(id, 0), bytes32(0));
+    }
+
     function testExecuteDueAndAdvance() public {
         uint256 id = createDue(50);
         vm.warp(block.timestamp + 1);
