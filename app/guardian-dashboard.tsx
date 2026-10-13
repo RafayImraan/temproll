@@ -6,7 +6,7 @@ import Link from 'next/link';
 import { createPublicClient, createWalletClient, custom, formatUnits, http, isAddress, keccak256, parseEventLogs, parseUnits, stringToHex, type EIP1193Provider } from 'viem';
 import { sepolia } from 'viem/chains';
 import { createVerifiedRegistrySchedule, registryErrorMessage, switchToSepolia, validateScheduleInput } from '@/lib/registry-flow.mjs';
-import { demoTokenAbi, explainPreflight, guardianAbi, readGuardianSnapshot } from '@/lib/guardian-flow.mjs';
+import { classifyPaymentFailure, demoTokenAbi, explainPreflight, guardianAbi, readGuardianSnapshot } from '@/lib/guardian-flow.mjs';
 import 'viem/window';
 
 type Schedule = {
@@ -336,7 +336,7 @@ export default function GuardianDashboard() {
       await refresh();
     } catch (error) {
       const message = chainError(error);
-      recordAttempt({ kind: 'Payment blocked or failed', status: 'blocked', detail: message, hash, scheduleId: schedule.id });
+      recordAttempt({ kind: 'Payment blocked or failed', status: classifyPaymentFailure(error), detail: message, hash, scheduleId: schedule.id });
       setLoadMessage(message);
     } finally { setBusy(''); }
   }
@@ -359,12 +359,15 @@ export default function GuardianDashboard() {
 
   const scheduleIds = new Set(snapshot?.schedules.map((schedule) => schedule.id) || []);
   const payments = snapshot?.payments.filter((payment) => scheduleIds.has(payment.id)) || [];
+  const confirmedPaymentHashes = new Set(payments.map((payment) => payment.hash.toLowerCase()));
   const blockedCount = attempts.filter((item) => item.status === 'blocked').length;
   const failedCount = attempts.filter((item) => item.status === 'failed').length;
   const flaggedCount = attempts.filter((item) => item.status === 'flagged' && item.kind === 'Security check').length;
   const latestHistory = [
     ...payments.map((payment) => ({ source: 'Sepolia', title: `Schedule #${payment.id} · installment ${payment.installment + 1}`, detail: `${formatAmount(payment.amount, snapshot?.decimals)} TROLL · ${short(payment.recipient)}`, hash: payment.hash, sort: Number(payment.blockNumber), type: 'onchain' })),
-    ...attempts.map((attempt) => ({ source: 'Local check', title: attempt.kind, detail: attempt.detail, hash: attempt.hash, sort: new Date(attempt.createdAt).getTime(), type: 'local' })),
+    ...attempts
+      .filter((attempt) => !(attempt.kind === 'Payment executed' && attempt.hash && confirmedPaymentHashes.has(attempt.hash.toLowerCase())))
+      .map((attempt) => ({ source: attempt.hash ? 'Sepolia tx' : 'Local', title: attempt.kind, detail: attempt.detail, hash: attempt.hash, sort: new Date(attempt.createdAt).getTime(), type: 'local' })),
   ].sort((a, b) => b.sort - a.sort).slice(0, 8);
 
   return <main className="app-shell">

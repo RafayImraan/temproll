@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { explainPreflight, guardianFlags, guardianAbi, demoTokenAbi } from '../lib/guardian-flow.mjs';
+import { classifyPaymentFailure, explainPreflight, guardianFlags, guardianAbi, demoTokenAbi } from '../lib/guardian-flow.mjs';
 
 test('Guardian explains a safe payment as low risk and allow', () => {
   assert.deepEqual(explainPreflight([0, 10, 0]), { flags: 0, score: 10, level: 'LOW', action: 'ALLOW', reasons: [] });
@@ -27,4 +27,11 @@ test('Guardian ABI exposes the contract-enforced preflight and payment flow', ()
   assert.ok(guardianAbi.some((item) => item.name === 'preflight'));
   assert.ok(guardianAbi.some((item) => item.name === 'execute'));
   assert.ok(demoTokenAbi.some((item) => item.name === 'mint'));
+});
+
+test('payment failures separate policy reverts from wallet and RPC failures', () => {
+  assert.equal(classifyPaymentFailure(new Error('DailyLimitExceeded()')), 'blocked');
+  assert.equal(classifyPaymentFailure(new Error('NotDue()')), 'blocked');
+  assert.equal(classifyPaymentFailure(Object.assign(new Error('User rejected request'), { code: 4001 })), 'failed');
+  assert.equal(classifyPaymentFailure(new Error('HTTP request failed')), 'failed');
 });
