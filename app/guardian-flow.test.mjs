@@ -36,6 +36,16 @@ test('Guardian ABI exposes the contract-enforced preflight and payment flow', ()
   assert.ok(demoTokenAbi.some((item) => item.name === 'mint'));
 });
 
+test('self-service Guardian ABI supports per-wallet registration, policy, allowlist and escrow funding', () => {
+  const names = guardianAbi.map((entry) => entry.name);
+  assert.ok(names.includes('registerEmployer'));
+  assert.ok(names.includes('deposit'));
+  assert.ok(names.includes('employerFunds'));
+  assert.equal(guardianAbi.find((entry) => entry.name === 'tokenPolicies').inputs.length, 2);
+  assert.equal(guardianAbi.find((entry) => entry.name === 'approvedRecipients').inputs.length, 2);
+  assert.ok(demoTokenAbi.some((entry) => entry.name === 'approve'));
+});
+
 test('payment failures separate policy reverts from wallet and RPC failures', () => {
   assert.equal(classifyPaymentFailure(new Error('DailyLimitExceeded()')), 'blocked');
   assert.equal(classifyPaymentFailure(new Error('NotDue()')), 'blocked');
@@ -61,6 +71,8 @@ test('Guardian snapshot decodes schedule and payment events with the contract AB
       if (functionName === 'executor') return employer;
       if (functionName === 'paused') return false;
       if (functionName === 'tokenPolicies') return [100n, 500n, 50n, 60n, true];
+      if (functionName === 'authorizedEmployers') return true;
+      if (functionName === 'employerFunds') return 500n;
       if (functionName === 'decimals') return 18;
       if (functionName === 'balanceOf') return 0n;
       if (functionName === 'schedules') return [employer, recipient, token, 25n, 25n, 604800n, 2000000000n, 0n, 0, true];

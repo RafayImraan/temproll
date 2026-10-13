@@ -27,6 +27,8 @@ type Snapshot = {
   executor: `0x${string}`;
   paused: boolean;
   policy: readonly [bigint, bigint, bigint, bigint, boolean];
+  employerAuthorized: boolean;
+  employerFunds: bigint;
   decimals: number;
   walletTokenBalance: bigint;
   paymentTokenBalance: bigint;
@@ -87,16 +89,15 @@ export default function GuardianDashboard() {
 
   const guardianConfigured = !!paymentsAddress && isAddress(paymentsAddress) && !!tokenAddress && isAddress(tokenAddress);
   const connectedToSepolia = chainId === sepolia.id;
-  const isOwner = !!snapshot && !!wallet && snapshot.owner.toLowerCase() === wallet.toLowerCase();
-  const isExecutor = !!snapshot && !!wallet && snapshot.executor.toLowerCase() === wallet.toLowerCase();
+  const isEmployer = !!snapshot?.employerAuthorized;
   const scheduleBlockReason = !wallet
-    ? 'Connect the contract owner wallet.'
+    ? 'Connect a Sepolia wallet.'
     : !connectedToSepolia
       ? 'Switch the wallet to Sepolia.'
       : !snapshot
         ? 'Waiting for contract data.'
-        : !isOwner
-          ? 'The connected wallet is not the contract owner.'
+        : !isEmployer
+          ? 'Register this wallet as an employer first.'
           : !snapshot.policy[4]
             ? 'Configure the payment policy first.'
             : !isAddress(recipient)
@@ -160,28 +161,28 @@ export default function GuardianDashboard() {
       const stored = JSON.parse(localStorage.getItem(attemptStorageKey) || '[]');
       if (Array.isArray(stored)) setAttempts(stored.filter((entry) => entry && typeof entry.detail === 'string').slice(0, 50));
     } catch { setAttempts([]); }
-    void readWallet();
     const provider = window.ethereum;
     if (!provider) return;
-    const update = () => { void readWallet(); };
+    const update = () => { if (wallet) void readWallet(); };
     provider.on?.('chainChanged', update);
     provider.on?.('accountsChanged', update);
     return () => {
       provider.removeListener?.('chainChanged', update);
       provider.removeListener?.('accountsChanged', update);
     };
-  }, [readWallet]);
+  }, [readWallet, wallet]);
 
   useEffect(() => { void refresh(); }, [refresh]);
 
   useEffect(() => {
     let active = true;
     if (!guardianConfigured || !isAddress(recipient)) { setRecipientAllowed(null); return; }
-    void publicClient.readContract({ address: paymentsAddress as `0x${string}`, abi: guardianAbi, functionName: 'approvedRecipients', args: [recipient as `0x${string}`] })
+    if (!wallet) { setRecipientAllowed(null); return; }
+    void publicClient.readContract({ address: paymentsAddress as `0x${string}`, abi: guardianAbi, functionName: 'approvedRecipients', args: [wallet, recipient as `0x${string}`] })
       .then((allowed) => { if (active) setRecipientAllowed(Boolean(allowed)); })
       .catch(() => { if (active) setRecipientAllowed(null); });
     return () => { active = false; };
-  }, [guardianConfigured, publicClient, recipient, snapshot]);
+  }, [guardianConfigured, publicClient, recipient, snapshot, wallet]);
 
   async function connectWallet() {
     const provider = window.ethereum;
@@ -193,6 +194,14 @@ export default function GuardianDashboard() {
       setChainId(await client.getChainId());
       setWalletMessage('');
     } catch (error) { setWalletMessage(chainError(error)); }
+  }
+
+  function disconnectWallet() {
+    setWallet(null);
+    setChainId(null);
+    setSnapshot(null);
+    setRecipientAllowed(null);
+    setWalletMessage('Wallet disconnected from Temproll.');
   }
 
   async function switchNetwork() {
@@ -245,7 +254,7 @@ export default function GuardianDashboard() {
     if (!isAddress(recipient)) { setLoadMessage('Enter a valid employee wallet address.'); return; }
     try {
       const { hash } = await sendGuardianCall(allowed ? 'Employee allowed' : 'Employee removed', 'setRecipientAllowed', [recipient, allowed]);
-      const current = await publicClient.readContract({ address: paymentsAddress as `0x${string}`, abi: guardianAbi, functionName: 'approvedRecipients', args: [recipient as `0x${string}`] });
+      const current = await publicClient.readContract({ address: paymentsAddress as `0x${string}`, abi: guardianAbi, functionName: 'approvedRecipients', args: [wallet!, recipient as `0x${string}`] });
       setRecipientAllowed(Boolean(current));
       setLoadMessage(`${allowed ? 'Employee allowed' : 'Employee access removed'} on Sepolia. ${short(hash)}.`);
     } catch { /* Error is already shown by sendGuardianCall. */ }
@@ -253,27 +262,43 @@ export default function GuardianDashboard() {
 
   async function tokenAction(action: 'mint' | 'fund', event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!wallet || !connectedToSepolia || !snapshot) { setLoadMessage('Connect the Guardian owner wallet on Sepolia first.'); return; }
+    if (!wallet || !connectedToSepolia || !snapshot || !isEmployer) { setLoadMessage('Connect and register this wallet on Sepolia first.'); return; }
     try {
       const value = parseUnits(action === 'mint' ? mintAmount : fundAmount, snapshot.decimals);
       if (value <= 0n) throw new Error('Enter a positive token amount.');
-      setBusy(action === 'mint' ? 'Minting test tokens' : 'Funding payment contract');
+      setBusy(action === 'mint' ? 'Minting test tokens' : 'Approving test-token deposit');
       const provider = window.ethereum;
       if (!provider) throw new Error('MetaMask was not found.');
       const client = createWalletClient({ chain: sepolia, transport: custom(provider as EIP1193Provider) });
-      const functionName = action === 'mint' ? 'mint' : 'transfer';
-      const args = action === 'mint' ? [wallet, value] : [paymentsAddress, value];
-      const hash = await client.writeContract({ account: wallet, address: tokenAddress as `0x${string}`, abi: demoTokenAbi, functionName, args } as never);
-      const receipt = await publicClient.waitForTransactionReceipt({ hash });
-      if (receipt.status !== 'success') throw new Error('Token transaction reverted on Sepolia.');
-      recordAttempt({ kind: action === 'mint' ? 'Test tokens minted' : 'Payment contract funded', status: 'flagged', detail: `${formatAmount(value, snapshot.decimals)} TROLL · Sepolia confirmed.`, hash });
-      setLoadMessage(`${action === 'mint' ? 'Test tokens minted' : 'Payment contract funded'}: ${short(hash)}.`);
+      let hash: `0x${string}`;
+      if (action === 'mint') {
+        hash = await client.writeContract({ account: wallet, address: tokenAddress as `0x${string}`, abi: demoTokenAbi, functionName: 'mint', args: [wallet, value] });
+        const receipt = await publicClient.waitForTransactionReceipt({ hash });
+        if (receipt.status !== 'success') throw new Error('Token mint reverted on Sepolia.');
+      } else {
+        hash = await client.writeContract({ account: wallet, address: tokenAddress as `0x${string}`, abi: demoTokenAbi, functionName: 'approve', args: [paymentsAddress as `0x${string}`, value] });
+        const approvalReceipt = await publicClient.waitForTransactionReceipt({ hash });
+        if (approvalReceipt.status !== 'success') throw new Error('Token approval reverted on Sepolia.');
+        setBusy('Funding employer balance');
+        hash = await client.writeContract({ account: wallet, address: paymentsAddress as `0x${string}`, abi: guardianAbi, functionName: 'deposit', args: [tokenAddress as `0x${string}`, value] });
+        const receipt = await publicClient.waitForTransactionReceipt({ hash });
+        if (receipt.status !== 'success') throw new Error('Employer funding reverted on Sepolia.');
+      }
+      recordAttempt({ kind: action === 'mint' ? 'Test tokens minted' : 'Employer balance funded', status: 'flagged', detail: `${formatAmount(value, snapshot.decimals)} TROLL · Sepolia confirmed.`, hash });
+      setLoadMessage(`${action === 'mint' ? 'Test tokens minted' : 'Employer balance funded'}: ${short(hash)}.`);
       await refresh();
     } catch (error) {
       const message = chainError(error);
       recordAttempt({ kind: action === 'mint' ? 'Mint failed' : 'Funding failed', status: 'failed', detail: message });
       setLoadMessage(message);
     } finally { setBusy(''); }
+  }
+
+  async function registerEmployer() {
+    try {
+      await sendGuardianCall('Employer registration', 'registerEmployer', []);
+      setLoadMessage('Wallet registered. Configure your policy and recipient list.');
+    } catch { /* Error is already shown by sendGuardianCall. */ }
   }
 
   async function createRecurringSchedule(event: React.FormEvent<HTMLFormElement>) {
@@ -326,7 +351,7 @@ export default function GuardianDashboard() {
   }
 
   async function executePayment(schedule: Schedule) {
-    if (!wallet || !connectedToSepolia || !isExecutor) { setLoadMessage('Connect the configured payment executor on Sepolia.'); return; }
+    if (!wallet || !connectedToSepolia) { setLoadMessage('Connect a wallet on Sepolia.'); return; }
     setBusy(`Executing schedule ${schedule.id}`);
     let hash: `0x${string}` | undefined;
     try {
@@ -366,7 +391,7 @@ export default function GuardianDashboard() {
     <header className="app-header">
       <Link className="app-brand" href="/"><Image src="/temproll-mark.svg" alt="" width={28} height={28} />Temproll</Link>
       <div className="app-header-right">
-        {wallet ? <div className={`wallet-label${chainId === sepolia.id ? '' : ' mismatch'}`}><span>{chainId === sepolia.id ? 'Sepolia' : chainId === 1 ? 'Ethereum Mainnet' : `Chain ${chainId}`} · {short(wallet)}</span>{chainId !== sepolia.id && <button onClick={() => void switchNetwork()}>Switch to Sepolia</button>}</div> : <button className="button button-primary" onClick={() => void connectWallet()}>Connect wallet</button>}
+        {wallet ? <div className={`wallet-label${chainId === sepolia.id ? '' : ' mismatch'}`}><span>{chainId === sepolia.id ? 'Sepolia' : chainId === 1 ? 'Ethereum Mainnet' : `Chain ${chainId}`} · {short(wallet)}</span>{chainId !== sepolia.id && <button onClick={() => void switchNetwork()}>Switch to Sepolia</button>}<button className="button" onClick={disconnectWallet}>Disconnect</button></div> : <button className="button button-primary" onClick={() => void connectWallet()}>Connect wallet</button>}
       </div>
     </header>
     <div className="app-content guardian-content">
@@ -377,6 +402,7 @@ export default function GuardianDashboard() {
       {loadMessage && <p className="action-message" role="status">{loadMessage}</p>}
 
       {guardianConfigured && <>
+      {wallet && connectedToSepolia && snapshot && !snapshot.employerAuthorized && <section className="guardian-section"><p>Set up this wallet as its own employer.</p><button className="button button-primary" onClick={() => void registerEmployer()} disabled={!!busy}>{busy === 'Employer registration' ? 'Registering...' : 'Register employer'}</button></section>}
       <section className="guardian-section">
         <div className="section-title"><h2>Policy</h2><span>{snapshot?.policy[4] ? 'Configured on Sepolia' : 'Not configured'}</span></div>
         <form className="policy-form" onSubmit={configurePolicy}>
@@ -384,9 +410,9 @@ export default function GuardianDashboard() {
           <label>Daily limit <span>TROLL</span><input type="number" min="0.000000000000000001" step="any" value={dailyLimit} onChange={(e) => setDailyLimit(e.target.value)} /></label>
           <label>Approval threshold <span>TROLL; 0 disables</span><input type="number" min="0" step="any" value={approvalThreshold} onChange={(e) => setApprovalThreshold(e.target.value)} /></label>
           <label>Recipient cooldown <span>seconds</span><input type="number" min="0" step="1" value={recipientCooldown} onChange={(e) => setRecipientCooldown(e.target.value)} /></label>
-          <button className="button button-primary" type="submit" disabled={!isOwner || !connectedToSepolia || !!busy}>{busy === 'Policy update' ? 'Saving…' : 'Save policy'}</button>
+          <button className="button button-primary" type="submit" disabled={!isEmployer || !connectedToSepolia || !!busy}>{busy === 'Policy update' ? 'Saving…' : 'Save policy'}</button>
         </form>
-        {snapshot && <p className="balance-line">Wallet: {formatAmount(snapshot.walletTokenBalance, snapshot.decimals)} TROLL <span>·</span> Payment contract: {formatAmount(snapshot.paymentTokenBalance, snapshot.decimals)} TROLL</p>}
+        {snapshot && <p className="balance-line">Wallet: {formatAmount(snapshot.walletTokenBalance, snapshot.decimals)} TROLL <span>·</span> Your payroll balance: {formatAmount(snapshot.employerFunds, snapshot.decimals)} TROLL</p>}
       </section>
 
       <section className="guardian-section">
@@ -396,8 +422,8 @@ export default function GuardianDashboard() {
           <label>Amount <span>TROLL</span><input type="number" min="0.000000000000000001" step="any" value={amount} onChange={(e) => setAmount(e.target.value)} required /></label>
           <label>Frequency<select value={cadence} onChange={(e) => setCadence(Number(e.target.value))}>{cadenceOptions.map((option) => <option value={option.seconds} key={option.seconds}>{option.label}</option>)}</select></label>
           <div className="schedule-access">
-            <button className="button" type="button" onClick={() => void changeRecipientAccess(true)} disabled={!isOwner || !connectedToSepolia || !!busy || !isAddress(recipient)}>Allow recipient</button>
-            <button className="button button-danger" type="button" onClick={() => void changeRecipientAccess(false)} disabled={!isOwner || !connectedToSepolia || !!busy || !isAddress(recipient)}>Remove access</button>
+            <button className="button" type="button" onClick={() => void changeRecipientAccess(true)} disabled={!isEmployer || !connectedToSepolia || !!busy || !isAddress(recipient)}>Allow recipient</button>
+            <button className="button button-danger" type="button" onClick={() => void changeRecipientAccess(false)} disabled={!isEmployer || !connectedToSepolia || !!busy || !isAddress(recipient)}>Remove access</button>
             <span>{recipientAllowed === true ? 'Allowed on Sepolia' : recipientAllowed === false ? 'Not allowed' : isAddress(recipient) ? 'Checking access...' : 'Enter a recipient'}</span>
           </div>
           <button className="button button-primary" type="submit" disabled={!!scheduleBlockReason}>{busy === 'Creating schedule' ? 'Creating...' : 'Create schedule'}</button>
@@ -409,8 +435,8 @@ export default function GuardianDashboard() {
       <section className="guardian-section">
         <div className="section-title"><h2>TROLL token</h2><span>No monetary value · Sepolia</span></div>
         <div className="token-actions">
-          <form onSubmit={(e) => void tokenAction('mint', e)}><label>Mint to wallet<input type="number" min="0.000000000000000001" step="any" value={mintAmount} onChange={(e) => setMintAmount(e.target.value)} /></label><button className="button" disabled={!isOwner || !connectedToSepolia || !!busy}>{busy === 'Minting test tokens' ? 'Minting...' : 'Mint'}</button></form>
-          <form onSubmit={(e) => void tokenAction('fund', e)}><label>Fund payment contract<input type="number" min="0.000000000000000001" step="any" value={fundAmount} onChange={(e) => setFundAmount(e.target.value)} /></label><button className="button" disabled={!isOwner || !connectedToSepolia || !!busy}>{busy === 'Funding payment contract' ? 'Funding...' : 'Fund'}</button></form>
+          <form onSubmit={(e) => void tokenAction('mint', e)}><label>Mint to wallet<input type="number" min="0.000000000000000001" step="any" value={mintAmount} onChange={(e) => setMintAmount(e.target.value)} /></label><button className="button" disabled={!isEmployer || !connectedToSepolia || !!busy}>{busy === 'Minting test tokens' ? 'Minting...' : 'Mint test tokens'}</button></form>
+          <form onSubmit={(e) => void tokenAction('fund', e)}><label>Fund your payroll balance<input type="number" min="0.000000000000000001" step="any" value={fundAmount} onChange={(e) => setFundAmount(e.target.value)} /></label><button className="button" disabled={!isEmployer || !connectedToSepolia || !!busy}>{busy.includes('Funding') || busy.includes('Approving') ? 'Funding...' : 'Fund'}</button></form>
         </div>
       </section>
 
@@ -425,8 +451,8 @@ export default function GuardianDashboard() {
             <div className="risk-details"><b>{assessment.action.replace('_', ' ')}</b>{assessment.reasons.length ? <ul>{assessment.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul> : <span>No policy flags.</span>}</div>
             <div className="payment-bottom"><span>{schedule.active ? `Due ${new Date(Number(schedule.nextDue) * 1000).toLocaleString()}` : 'Inactive'} · installment {schedule.executions + 1}</span><div>
               <button className="text-button" onClick={() => void runSecurityCheck(schedule)} disabled={!!busy}>Check rules</button>
-              {assessment.action === 'REQUIRE_APPROVAL' && isOwner && <button className="text-button" onClick={() => void approvePayment(schedule)} disabled={!!busy}>Approve</button>}
-              {assessment.action === 'ALLOW' && <button className="text-button" onClick={() => void executePayment(schedule)} disabled={!isExecutor || !connectedToSepolia || !!busy}>Execute payment</button>}
+              {assessment.action === 'REQUIRE_APPROVAL' && isEmployer && <button className="text-button" onClick={() => void approvePayment(schedule)} disabled={!!busy}>Approve</button>}
+              {assessment.action === 'ALLOW' && <button className="text-button" onClick={() => void executePayment(schedule)} disabled={!connectedToSepolia || !!busy}>Execute payment</button>}
             </div></div>
           </article>;
         })}</div>

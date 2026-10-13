@@ -3,6 +3,7 @@ pragma solidity ^0.8.28;
 
 interface ITIP20 {
     function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
 }
 
@@ -68,9 +69,10 @@ contract RecurringPayments {
     mapping(uint256 => mapping(uint32 => bool)) public executed;
     mapping(uint256 => address) public pendingRecipients;
     mapping(uint256 => uint64) public recipientChangeAt;
-    mapping(address => bool) public approvedRecipients;
-    mapping(address => TokenPolicy) public tokenPolicies;
-    mapping(address => mapping(uint64 => uint256)) public dailySpent;
+    mapping(address => mapping(address => bool)) public approvedRecipients;
+    mapping(address => mapping(address => TokenPolicy)) public tokenPolicies;
+    mapping(address => mapping(address => uint256)) public employerFunds;
+    mapping(address => mapping(address => mapping(uint64 => uint256))) public dailySpent;
     mapping(uint256 => mapping(uint32 => bytes32)) public paymentApprovals;
 
     event ExecutorUpdated(address indexed executor);
@@ -86,6 +88,8 @@ contract RecurringPayments {
     event RecipientChanged(uint256 indexed id, address indexed previousRecipient, address indexed newRecipient);
     event PaymentApproved(uint256 indexed id, uint32 indexed installment, address recipient, uint256 amount, uint64 dueAt);
     event PaymentExecuted(uint256 indexed id, uint32 indexed execution, address indexed recipient, address token, uint256 amount, uint64 nextDue);
+    event EmployerRegistered(address indexed employer);
+    event EmployerFunded(address indexed employer, address indexed token, uint256 amount);
 
     modifier onlyOwner() { if (msg.sender != owner) revert Unauthorized(); _; }
     modifier onlyExecutor() { if (msg.sender != executor) revert Unauthorized(); _; }
@@ -97,6 +101,13 @@ contract RecurringPayments {
         owner = msg.sender;
         executor = initialExecutor;
         authorizedEmployers[msg.sender] = true;
+    }
+
+    /// @notice Open self-service registration for independent employer wallets.
+    function registerEmployer() external {
+        if (authorizedEmployers[msg.sender]) revert InvalidSchedule();
+        authorizedEmployers[msg.sender] = true;
+        emit EmployerRegistered(msg.sender);
     }
 
     function setEmployerAuthorized(address employer, bool authorized) external onlyOwner {
@@ -111,15 +122,15 @@ contract RecurringPayments {
         emit ExecutorUpdated(next);
     }
 
-    function setTokenPolicy(address token, uint128 maxPerPayment, uint128 dailyLimit, uint128 approvalThreshold, uint64 recipientChangeCooldown) external onlyOwner {
+    function setTokenPolicy(address token, uint128 maxPerPayment, uint128 dailyLimit, uint128 approvalThreshold, uint64 recipientChangeCooldown) external onlyAuthorizedEmployer {
         if (token == address(0) || maxPerPayment == 0 || dailyLimit < maxPerPayment || approvalThreshold > maxPerPayment) revert InvalidSchedule();
-        tokenPolicies[token] = TokenPolicy(maxPerPayment, dailyLimit, approvalThreshold, recipientChangeCooldown, true);
+        tokenPolicies[msg.sender][token] = TokenPolicy(maxPerPayment, dailyLimit, approvalThreshold, recipientChangeCooldown, true);
         emit TokenPolicyUpdated(token, maxPerPayment, dailyLimit, approvalThreshold, recipientChangeCooldown);
     }
 
-    function setRecipientAllowed(address recipient, bool allowed) external onlyOwner {
+    function setRecipientAllowed(address recipient, bool allowed) external onlyAuthorizedEmployer {
         if (recipient == address(0)) revert InvalidSchedule();
-        approvedRecipients[recipient] = allowed;
+        approvedRecipients[msg.sender][recipient] = allowed;
         emit RecipientApprovalUpdated(recipient, allowed);
     }
 
@@ -127,9 +138,9 @@ contract RecurringPayments {
     function unpause() external onlyOwner { paused = false; emit Unpaused(msg.sender); }
 
     function createSchedule(address recipient, address token, uint128 amount, uint128 maxPerPayment, uint64 firstDue, uint64 interval, uint64 endAt) external onlyAuthorizedEmployer returns (uint256 id) {
-        TokenPolicy memory policy = tokenPolicies[token];
+        TokenPolicy memory policy = tokenPolicies[msg.sender][token];
         if (recipient == address(0) || token == address(0) || amount == 0 || maxPerPayment < amount || interval == 0 || firstDue <= block.timestamp || (endAt != 0 && endAt < firstDue) || !policy.configured) revert InvalidSchedule();
-        if (!approvedRecipients[recipient]) revert RecipientNotAllowed();
+        if (!approvedRecipients[msg.sender][recipient]) revert RecipientNotAllowed();
         if (amount > policy.maxPerPayment || maxPerPayment > policy.maxPerPayment) revert LimitExceeded();
         id = nextScheduleId++;
         schedules[id] = Schedule(msg.sender, recipient, token, amount, maxPerPayment, interval, firstDue, endAt, 0, true);
@@ -148,9 +159,9 @@ contract RecurringPayments {
         Schedule storage s = schedules[id];
         if (s.owner != msg.sender) revert Unauthorized();
         if (!s.active) revert Inactive();
-        TokenPolicy memory policy = tokenPolicies[token];
+        TokenPolicy memory policy = tokenPolicies[msg.sender][token];
         if (recipient == address(0) || token == address(0) || amount == 0 || maxPerPayment < amount || nextDue <= block.timestamp || interval == 0 || (endAt != 0 && endAt < nextDue) || !policy.configured) revert InvalidSchedule();
-        if (!approvedRecipients[recipient]) revert RecipientNotAllowed();
+        if (!approvedRecipients[msg.sender][recipient]) revert RecipientNotAllowed();
         if (amount > policy.maxPerPayment || maxPerPayment > policy.maxPerPayment) revert LimitExceeded();
         if (recipient != s.recipient) {
             if (pendingRecipients[id] != address(0)) revert RecipientChangePending();
@@ -175,7 +186,7 @@ contract RecurringPayments {
         address pendingRecipient = pendingRecipients[id];
         if (pendingRecipient == address(0)) revert InvalidSchedule();
         if (block.timestamp < recipientChangeAt[id]) revert RecipientCooldown();
-        if (!approvedRecipients[pendingRecipient]) revert RecipientNotAllowed();
+        if (!approvedRecipients[msg.sender][pendingRecipient]) revert RecipientNotAllowed();
         address previous = s.recipient;
         s.recipient = pendingRecipient;
         delete pendingRecipients[id];
@@ -189,11 +200,20 @@ contract RecurringPayments {
         if (s.owner != msg.sender) revert Unauthorized();
         if (!s.active) revert Inactive();
         if (pendingRecipients[id] != address(0)) revert RecipientChangePending();
-        TokenPolicy memory policy = tokenPolicies[s.token];
+        TokenPolicy memory policy = tokenPolicies[msg.sender][s.token];
         if (!policy.configured || policy.approvalThreshold == 0 || s.amount < policy.approvalThreshold) revert InvalidSchedule();
         bytes32 terms = _approvalTerms(id, s);
         paymentApprovals[id][s.executions] = terms;
         emit PaymentApproved(id, s.executions, s.recipient, s.amount, s.nextDue);
+    }
+
+    /// @notice Deposit test tokens into the caller's isolated payroll balance.
+    function deposit(address token, uint256 amount) external nonReentrant {
+        if (!authorizedEmployers[msg.sender] || token == address(0) || amount == 0) revert InvalidSchedule();
+        (bool ok, bytes memory data) = token.call(abi.encodeCall(ITIP20.transferFrom, (msg.sender, address(this), amount)));
+        if (!ok || (data.length != 0 && (data.length < 32 || !abi.decode(data, (bool))))) revert TransferFailed();
+        employerFunds[msg.sender][token] += amount;
+        emit EmployerFunded(msg.sender, token, amount);
     }
 
     /// @notice Transparent deterministic policy result. `flags` bit values are public constants above.
@@ -205,19 +225,17 @@ contract RecurringPayments {
         if (s.owner == address(0) || !s.active || paused) flags |= FLAG_INACTIVE;
         if (block.timestamp < s.nextDue) flags |= FLAG_NOT_DUE;
         if (s.endAt != 0 && s.nextDue > s.endAt) flags |= FLAG_EXPIRED;
-        if (!approvedRecipients[s.recipient]) flags |= FLAG_RECIPIENT_NOT_ALLOWED;
+        if (!approvedRecipients[s.owner][s.recipient]) flags |= FLAG_RECIPIENT_NOT_ALLOWED;
         if (pendingRecipients[id] != address(0)) flags |= FLAG_RECIPIENT_CHANGE_PENDING;
-        TokenPolicy memory policy = tokenPolicies[s.token];
+        TokenPolicy memory policy = tokenPolicies[s.owner][s.token];
         if (!policy.configured || s.amount > s.maxPerPayment || s.amount > policy.maxPerPayment) flags |= FLAG_PAYMENT_CAP;
         uint64 day = uint64(block.timestamp / 1 days);
-        spentToday = dailySpent[s.token][day];
+        spentToday = dailySpent[s.owner][s.token][day];
         if (!policy.configured || spentToday + s.amount > policy.dailyLimit) flags |= FLAG_DAILY_LIMIT;
         else if (spentToday + s.amount >= (uint256(policy.dailyLimit) * 75) / 100) flags |= FLAG_NEAR_DAILY_LIMIT;
         if (s.token != address(0)) {
-            try ITIP20(s.token).balanceOf(address(this)) returns (uint256 balance) {
-                tokenBalance = balance;
-                if (balance < s.amount) flags |= FLAG_INSUFFICIENT_BALANCE;
-            } catch { flags |= FLAG_INSUFFICIENT_BALANCE; }
+            tokenBalance = employerFunds[s.owner][s.token];
+            if (tokenBalance < s.amount) flags |= FLAG_INSUFFICIENT_BALANCE;
         } else {
             flags |= FLAG_INSUFFICIENT_BALANCE;
         }
@@ -230,7 +248,8 @@ contract RecurringPayments {
     }
 
     /// @notice Execute exactly the currently due installment after enforcing all configured policies.
-    function execute(uint256 id) external onlyExecutor nonReentrant {
+    /// @notice Anyone may trigger a due payment; destination, amount and employer escrow are fixed by schedule policy.
+    function execute(uint256 id) external nonReentrant {
         (uint16 flags,,,) = _preflightFlags(id);
         if (flags & FLAG_INACTIVE != 0) revert Inactive();
         if (flags & FLAG_NOT_DUE != 0) revert NotDue();
@@ -251,7 +270,9 @@ contract RecurringPayments {
         uint64 day = uint64(block.timestamp / 1 days);
         executed[id][installment] = true;
         delete paymentApprovals[id][installment];
-        dailySpent[token][day] += amount;
+        if (employerFunds[s.owner][token] < amount) revert InsufficientTokenBalance();
+        employerFunds[s.owner][token] -= amount;
+        dailySpent[s.owner][token][day] += amount;
         (bool ok, bytes memory data) = token.call(abi.encodeCall(ITIP20.transfer, (recipient, amount)));
         if (!ok || (data.length != 0 && (data.length < 32 || !abi.decode(data, (bool))))) revert TransferFailed();
         unchecked { s.executions = installment + 1; }

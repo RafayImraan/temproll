@@ -6,10 +6,16 @@ import "../src/RecurringPayments.sol";
 
 contract TestToken {
     mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
     bool public fail;
     function mint(address who, uint256 amount) external { balanceOf[who] += amount; }
     function burn(address who, uint256 amount) external { balanceOf[who] -= amount; }
     function setFail(bool value) external { fail = value; }
+    function approve(address spender, uint256 amount) external returns (bool) { allowance[msg.sender][spender] = amount; return true; }
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        if (fail || allowance[from][msg.sender] < amount || balanceOf[from] < amount) return false;
+        allowance[from][msg.sender] -= amount; balanceOf[from] -= amount; balanceOf[to] += amount; return true;
+    }
     function transfer(address to, uint256 amount) external returns (bool) {
         if (fail || balanceOf[msg.sender] < amount) return false;
         balanceOf[msg.sender] -= amount;
@@ -28,21 +34,19 @@ contract RecurringPaymentsTest is Test {
         token = new TestToken();
         payments.setTokenPolicy(address(token), 1000, 2000, 0, 1 days);
         payments.setRecipientAllowed(vendor, true);
-        token.mint(address(payments), 1000);
+        token.mint(address(this), 1000);
+        token.approve(address(payments), 1000);
+        payments.deposit(address(token), 1000);
     }
     function createDue(uint128 amount) internal returns (uint256) {
         return payments.createSchedule(vendor, address(token), amount, amount, uint64(block.timestamp + 1), 30 days, 0);
     }
     function testOnlyAuthorizedEmployersCanCreateSchedules() public {
         address employer = address(0xE2);
-        vm.prank(employer);
-        vm.expectRevert(RecurringPayments.Unauthorized.selector);
-        payments.createSchedule(vendor, address(token), 10, 10, uint64(block.timestamp + 1), 30 days, 0);
-        assertEq(payments.nextScheduleId(), 1);
-        assertEq(token.balanceOf(vendor), 0);
-
-        payments.setEmployerAuthorized(employer, true);
+        vm.prank(employer); payments.registerEmployer();
         assertTrue(payments.authorizedEmployers(employer));
+        vm.prank(employer); payments.setTokenPolicy(address(token), 100, 200, 0, 0);
+        vm.prank(employer); payments.setRecipientAllowed(vendor, true);
         vm.prank(employer);
         uint256 id = payments.createSchedule(vendor, address(token), 10, 10, uint64(block.timestamp + 1), 30 days, 0);
         (address scheduleOwner,,,,,,,,,) = payments.schedules(id);
@@ -58,8 +62,9 @@ contract RecurringPaymentsTest is Test {
 
     function testOnlyScheduleEmployerCanApproveItsInstallment() public {
         address employer = address(0xE2);
-        payments.setEmployerAuthorized(employer, true);
-        payments.setTokenPolicy(address(token), 1000, 2000, 20, 1 days);
+        vm.prank(employer); payments.registerEmployer();
+        vm.prank(employer); payments.setTokenPolicy(address(token), 1000, 2000, 20, 1 days);
+        vm.prank(employer); payments.setRecipientAllowed(vendor, true);
         vm.prank(employer);
         uint256 id = payments.createSchedule(vendor, address(token), 25, 25, uint64(block.timestamp + 1), 30 days, 0);
 
@@ -81,10 +86,11 @@ contract RecurringPaymentsTest is Test {
         (,,,,,,,, uint32 count, bool active) = payments.schedules(id);
         assertEq(count, 1); assertTrue(active);
     }
-    function testRejectUnauthorizedExecutor() public {
+    function testAnyCallerCanExecuteDueSchedule() public {
         uint256 id = createDue(10);
         vm.warp(block.timestamp + 1);
-        vm.expectRevert(RecurringPayments.Unauthorized.selector); payments.execute(id);
+        vm.prank(address(0xBAD)); payments.execute(id);
+        assertEq(token.balanceOf(vendor), 10);
     }
     function testRejectEarlyAndFailedTransferDoesNotConsume() public {
         uint256 id = createDue(10);
@@ -106,14 +112,17 @@ contract RecurringPaymentsTest is Test {
     }
 
     function testInsufficientBalanceDoesNotConsumeInstallmentAndCanRetry() public {
-        token.burn(address(payments), 1000);
-        uint256 id = createDue(25);
+        address employer = address(0xE2);
+        vm.prank(employer); payments.registerEmployer();
+        vm.prank(employer); payments.setTokenPolicy(address(token), 100, 200, 0, 0);
+        vm.prank(employer); payments.setRecipientAllowed(vendor, true);
+        vm.prank(employer); uint256 id = payments.createSchedule(vendor, address(token), 25, 25, uint64(block.timestamp + 1), 30 days, 0);
         vm.warp(block.timestamp + 1);
-        vm.prank(executor); vm.expectRevert(RecurringPayments.InsufficientTokenBalance.selector); payments.execute(id);
+        vm.prank(address(0xBAD)); vm.expectRevert(RecurringPayments.InsufficientTokenBalance.selector); payments.execute(id);
         (,,,,,,,, uint32 count,) = payments.schedules(id);
         assertEq(count, 0);
-        token.mint(address(payments), 25);
-        vm.prank(executor); payments.execute(id);
+        token.mint(employer, 25); vm.prank(employer); token.approve(address(payments), 25); vm.prank(employer); payments.deposit(address(token), 25);
+        vm.prank(address(0xBAD)); payments.execute(id);
         assertEq(token.balanceOf(vendor), 25);
     }
 
@@ -131,8 +140,7 @@ contract RecurringPaymentsTest is Test {
         payments.setExecutor(address(0xE2));
         uint256 id = createDue(1);
         vm.warp(block.timestamp + 1);
-        vm.prank(executor); vm.expectRevert(RecurringPayments.Unauthorized.selector); payments.execute(id);
-        vm.prank(address(0xE2)); payments.execute(id);
+        vm.prank(address(0xBAD)); payments.execute(id);
     }
 
     function testScheduleCannotBeCreatedWithInvalidLimitOrTiming() public {
@@ -270,15 +278,18 @@ contract RecurringPaymentsTest is Test {
     }
 
     function testPreflightReportsInsufficientTokenBalanceAndExecutionDoesNotPay() public {
-        token.burn(address(payments), 1000);
-        uint256 id = createDue(10);
+        address employer = address(0xE2);
+        vm.prank(employer); payments.registerEmployer();
+        vm.prank(employer); payments.setTokenPolicy(address(token), 100, 200, 0, 0);
+        vm.prank(employer); payments.setRecipientAllowed(vendor, true);
+        vm.prank(employer); uint256 id = payments.createSchedule(vendor, address(token), 10, 10, uint64(block.timestamp + 1), 30 days, 0);
         vm.warp(block.timestamp + 1);
         (uint16 flags, uint8 score, uint8 action,,, uint256 balance,) = payments.preflight(id);
         assertTrue(flags & payments.FLAG_INSUFFICIENT_BALANCE() != 0);
         assertEq(score, 100);
         assertEq(action, 2);
         assertEq(balance, 0);
-        vm.prank(executor); vm.expectRevert(RecurringPayments.InsufficientTokenBalance.selector); payments.execute(id);
+        vm.prank(address(0xBAD)); vm.expectRevert(RecurringPayments.InsufficientTokenBalance.selector); payments.execute(id);
         assertEq(token.balanceOf(vendor), 0);
     }
 }

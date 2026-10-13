@@ -1,10 +1,10 @@
 # Temproll
 
-Temproll is a Sepolia hackathon demo for payroll policy checks. The Guardian contract checks a scheduled test-token installment against an employer allowlist, per-payment cap, daily cap, available contract balance, due time, and (when configured) a one-use employer approval. The check explains its result; the contract enforces the same rules again before a token transfer.
+Temproll is a Sepolia hackathon project for payroll policy checks. The Guardian contract checks a scheduled test-token installment against an employer-specific allowlist, per-payment cap, daily cap, escrow balance, due time, and (when configured) a one-use employer approval. The contract enforces these rules again before a token transfer.
 
-The payment executor is manual. There is no keeper or automatic settlement. `TROLL` is a demo-only token with no monetary value. Schedule data, recipients, policies, and transfers are public on Sepolia. The older `PayrollScheduleRegistry` records schedule metadata only and remains a separate contract. Noir proof generation/verification is not connected to this flow.
+Payment triggering is manual by any wallet; there is no keeper or automatic settlement. `TROLL` is a test-only token with no monetary value. Schedule data, recipients, policies, and transfers are public on Sepolia. The older `PayrollScheduleRegistry` records schedule metadata only and remains a separate contract. Noir proof generation/verification is not connected to this flow.
 
-Only authorized employers can create schedules. The deploying owner is authorized at construction; the owner may grant or revoke other employers with `setEmployerAuthorized`. An employer can approve only installments belonging to its own schedules.
+Each wallet registers itself as an independent employer. Policies, recipient allowlists, daily spending, and escrowed TROLL balances are isolated per employer. Anyone can trigger a due installment, but the contract pays only the schedule's fixed recipient and debits only that employer's escrow after enforcing policy. TROLL minting is permissionless on this test-only token and capped at 100,000 TROLL per wallet. These permissionless test facilities are not suitable for real assets.
 
 ## Run locally
 
@@ -37,7 +37,7 @@ Remove-Item Env:SEPOLIA_DEPLOYER_PRIVATE_KEY
 if ($deployExitCode -ne 0) { throw 'Guardian deployment failed.' }
 ```
 
-The deployment wallet becomes both the Guardian owner and payment executor. In `.env.local`, set the printed public addresses and start block, plus a public Sepolia RPC URL:
+The deployment wallet is the Guardian owner for pause/emergency controls; any wallet can register and manage its own payroll. In `.env.local`, set the printed public addresses and start block, plus a public Sepolia RPC URL:
 
 ```dotenv
 NEXT_PUBLIC_SEPOLIA_RPC_URL=https://YOUR_PUBLIC_SEPOLIA_RPC_URL
@@ -51,16 +51,16 @@ Do not add secrets to `NEXT_PUBLIC_*`; those values are sent to the browser. Res
 
 ## Demo flow
 
-1. Connect the deployer wallet and switch to Sepolia.
-2. Save a token policy. Example: cap `500`, daily limit `2000`, approval threshold `400`, recipient-change cooldown `60` seconds. These values cost Sepolia gas to write.
-3. Allow an employee address. Mint TROLL to the connected wallet, then fund the payment contract with TROLL.
+1. Connect any wallet with Sepolia ETH and switch to Sepolia. Select **Register employer** once; this costs gas.
+2. Save a token policy. Example: cap `500`, daily limit `2000`, approval threshold `400`, recipient-change cooldown `60` seconds. Policy applies only to the connected employer wallet.
+3. Allow an employee address. Mint test TROLL to the connected wallet, then fund that employer's isolated balance. Funding uses an ERC-20 approval followed by a deposit transaction.
 4. Create a schedule for an allowed employee. Its first installment is due about two minutes later.
 5. Run **Security Check**. It reads the contract preflight result and labels it LOW, MEDIUM, or HIGH with ALLOW, REQUIRE APPROVAL, or BLOCK.
-6. For a high-value installment, use the owner wallet to approve that exact installment. Connect the configured executor wallet and execute when due. The app waits for a successful receipt, checks `PaymentExecuted`, and verifies the recipient token balance delta before showing it as a verified payment.
+6. For a high-value installment, approve that exact installment from the schedule-owning wallet. Any Sepolia wallet can trigger the due payment; the contract enforces the stored policy and isolated escrow. The app waits for a successful receipt, checks `PaymentExecuted`, and verifies the recipient token balance delta.
 7. Try an unapproved recipient, over-cap value, missing token balance, or duplicate/early execution. The UI shows the reason; on-chain policy violations revert without a token transfer. Duplicate execution is prevented because the installment advances after success and is also tracked on-chain.
 8. Review recent activity. Etherscan links represent chain-confirmed transactions; check attempts are stored locally in this browser.
 
-The recipient-change cooldown is enforced by the contract. This basic UI does not expose schedule editing; use contract tests for that path. Do not describe TROLL transfers as private or as real payroll settlement.
+The recipient-change cooldown is enforced by the contract. This basic UI does not expose schedule editing; use contract tests for that path. Existing Guardian deployments use the old owner-only/global-balance contract and are incompatible with this self-service version. Deploy fresh contracts and configure their new addresses before using judge wallets. Do not describe TROLL transfers as private or as real payroll settlement.
 
 ## Checks
 
