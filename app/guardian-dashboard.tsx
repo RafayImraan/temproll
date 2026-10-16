@@ -137,7 +137,7 @@ export default function GuardianDashboard() {
     } catch {
       setWalletMessage('Wallet unavailable. Unlock MetaMask and try again.');
     }
-  }, []);
+  }, [activeChain]);
 
   const refresh = useCallback(async () => {
     if (!guardianConfigured || !wallet) return;
@@ -164,7 +164,7 @@ export default function GuardianDashboard() {
     } finally {
       setLoading(false);
     }
-  }, [activeChain.id, guardianConfigured, networkName, publicClient, wallet]);
+  }, [activeChain.id, guardianConfigured, networkName, paymentsAddress, publicClient, startBlock, tokenAddress, wallet]);
 
   useEffect(() => {
     try {
@@ -192,7 +192,7 @@ export default function GuardianDashboard() {
       .then((allowed) => { if (active) setRecipientAllowed(Boolean(allowed)); })
       .catch(() => { if (active) setRecipientAllowed(null); });
     return () => { active = false; };
-  }, [guardianConfigured, publicClient, recipient, snapshot, wallet]);
+  }, [guardianConfigured, paymentsAddress, publicClient, recipient, snapshot, wallet]);
 
   async function connectWallet() {
     const provider = window.ethereum;
