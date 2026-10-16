@@ -12,6 +12,7 @@
     "contract:deploy": "node contracts/scripts/deploy-registry.mjs",
     "contract:compile-guardian": "node contracts/scripts/compile-guardian.mjs",
     "contract:deploy-guardian": "node contracts/scripts/deploy-guardian.mjs",
+    "contract:deploy-guardian-horizon": "node contracts/scripts/deploy-guardian-horizon.mjs",
     "contract:verify": "node contracts/scripts/verify-registry.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "next lint",

@@ -1,8 +1,8 @@
 # Temproll
 
-Temproll is a Sepolia hackathon project for payroll policy checks. The Guardian contract checks a scheduled test-token installment against an employer-specific allowlist, per-payment cap, daily cap, escrow balance, due time, and (when configured) a one-use employer approval. The contract enforces these rules again before a token transfer.
+Temproll manages payroll schedules and enforces payment rules on Sepolia and Horizen Testnet. Use the network selector in the dashboard; each network has its own RPC and Guardian contract configuration. The Guardian contract checks a scheduled test-token installment against an employer-specific allowlist, per-payment cap, daily cap, escrow balance, due time, and (when configured) a one-use employer approval. The contract enforces these rules again before a token transfer.
 
-Payment triggering is manual by any wallet; there is no keeper or automatic settlement. `TROLL` is a test-only token with no monetary value. Schedule data, recipients, policies, and transfers are public on Sepolia. The older `PayrollScheduleRegistry` records schedule metadata only and remains a separate contract. Noir proof generation/verification is not connected to this flow.
+Payment triggering is manual by any wallet; there is no keeper or automatic settlement. `TROLL` is a test-only token with no monetary value. Schedule data, recipients, policies, and transfers are public on whichever testnet is selected. The older `PayrollScheduleRegistry` records schedule metadata only and remains a separate contract. Noir proof generation/verification is not connected to this flow.
 
 Each wallet registers itself as an independent employer. Policies, recipient allowlists, daily spending, and escrowed TROLL balances are isolated per employer. Anyone can trigger a due installment, but the contract pays only the schedule's fixed recipient and debits only that employer's escrow after enforcing policy. TROLL minting is permissionless on this test-only token and capped at 100,000 TROLL per wallet. These permissionless test facilities are not suitable for real assets.
 
@@ -13,9 +13,11 @@ npm.cmd install
 npm.cmd run dev
 ```
 
-Open `http://localhost:3000`. Without the Guardian contracts configured, the page explains what is missing. Wallet connection is optional for browsing, but MetaMask on Sepolia and test ETH are needed for writes. The page reads Sepolia records and recent attempts stored in this browser; local attempt history is not a chain record.
+Open `http://localhost:3000`. Without the selected network's Guardian contracts configured, the page explains what is missing. Wallet connection is optional for browsing, but MetaMask and that testnet's test ETH are needed for writes. The page reads records from the selected testnet and recent attempts stored in this browser; local attempt history is not a chain record.
 
-## Deploy the demo payment contracts manually
+Select **Horizen Testnet** in the network selector to use Horizen's EVM testnet (chain ID `2651420`). Its default public RPC is `https://horizen-testnet.rpc.caldera.xyz/http`, and its explorer is `https://explorer-testnet.horizen.io`. Configure separate `NEXT_PUBLIC_HORIZON_*` contract addresses and deployment block; contract addresses deployed to Sepolia cannot be reused there. Test ETH is available through the [Horizen testnet faucet](https://hub-testnet.horizen.io/).
+
+## Deploy the Sepolia payment contracts manually
 
 The existing schedule registry is not redeployed. Guardian uses two new contracts: `TestPayrollToken` and `RecurringPayments`. Deployment sends two Sepolia transactions and creates a token with no monetary value. Do not run the deploy command until you deliberately choose to deploy these contracts. Keep the test wallet private key only in the temporary PowerShell process; never put it in `.env.local`, frontend variables, a tracked file, or chat. Never use a wallet holding real funds.
 
@@ -47,9 +49,11 @@ NEXT_PUBLIC_TEST_PAYROLL_TOKEN_ADDRESS=0x...printed-address...
 NEXT_PUBLIC_GUARDIAN_DEPLOYMENT_BLOCK=...printed-block...
 ```
 
+To deploy the same test-only contracts to Horizen Testnet, use `HORIZON_RPC_URL` and a test-only `HORIZON_DEPLOYER_PRIVATE_KEY` in the temporary shell, then run `npm.cmd run contract:deploy-guardian-horizon`. The script validates chain ID `2651420` and prints the three `NEXT_PUBLIC_HORIZON_*` values. Keep Sepolia and Horizen contract addresses and deployment blocks separate.
+
 Do not add secrets to `NEXT_PUBLIC_*`; those values are sent to the browser. Restart the dev server after editing `.env.local`.
 
-## Demo flow
+## Try a payroll payment
 
 1. Connect any wallet with Sepolia ETH and switch to Sepolia. Select **Register employer** once; this costs gas.
 2. Save a token policy. Example: cap `500`, daily limit `2000`, approval threshold `400`, recipient-change cooldown `60` seconds. Policy applies only to the connected employer wallet.

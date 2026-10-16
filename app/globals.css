@@ -15,6 +15,13 @@ button { cursor: pointer; }
 .app-header { height: 64px; padding: 0 max(22px, calc((100vw - 960px) / 2)); display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }
 .app-brand { display: flex; align-items: center; gap: 8px; color: var(--ink); font-size: 19px; font-weight: 700; text-decoration: none; }
 .app-header-right { display: flex; align-items: center; gap: 12px; }
+.network-switcher { display: flex; align-items: center; gap: 9px; padding: 5px 8px 5px 11px; border: 1px solid var(--line); border-radius: 10px; background: #f8faf9; }
+.network-switcher-label { color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.network-select-wrap { position: relative; }
+.network-select-wrap::after { position: absolute; top: 50%; right: 9px; width: 7px; height: 7px; border-right: 1.5px solid #64716a; border-bottom: 1.5px solid #64716a; content: ''; pointer-events: none; transform: translateY(-70%) rotate(45deg); }
+.app-header-right .network-switcher select { width: auto; min-width: 144px; height: 36px; padding: 0 31px 0 11px; appearance: none; border: 1px solid #d8e1dc; border-radius: 7px; background: #fff; color: var(--ink); font-size: 13px; font-weight: 600; cursor: pointer; }
+.app-header-right .network-switcher select:hover { border-color: #9cb6a8; }
+.app-header-right .network-switcher select:focus-visible { outline: 3px solid #176b4b30; outline-offset: 2px; }
 .wallet-label { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 13px; }
 .wallet-label.mismatch { color: #8b541f; }
 .wallet-label button { padding: 0; border: 0; background: none; color: var(--green); font-weight: 700; }
@@ -73,6 +80,9 @@ button { cursor: pointer; }
 
 @media (max-width: 650px) {
   .app-header { height: 58px; padding: 0 16px; }
+  .network-switcher { gap: 6px; padding: 4px 5px 4px 8px; }
+  .network-switcher-label { font-size: 9px; }
+  .app-header-right .network-switcher select { min-width: 116px; height: 34px; padding-left: 8px; font-size: 12px; }
   .guardian-content { width: calc(100% - 32px); margin: 30px auto 48px; }
   .wallet-label { align-items: flex-end; flex-direction: column; gap: 4px; font-size: 11px; }
   .policy-form, .schedule-form { grid-template-columns: 1fr; }

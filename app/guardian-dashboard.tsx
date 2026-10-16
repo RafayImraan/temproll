@@ -5,7 +5,7 @@ import Image from 'next/image';
 import Link from 'next/link';
 import { createPublicClient, createWalletClient, custom, formatUnits, http, isAddress, parseEventLogs, parseUnits, type EIP1193Provider } from 'viem';
 import { sepolia } from 'viem/chains';
-import { switchToSepolia } from '@/lib/registry-flow.mjs';
+import { horizon, switchToNetwork } from '@/lib/registry-flow.mjs';
 import { canRefreshGuardian, classifyPaymentFailure, demoTokenAbi, explainPreflight, guardianAbi, readGuardianSnapshot } from '@/lib/guardian-flow.mjs';
 import 'viem/window';
 
@@ -36,11 +36,6 @@ type Snapshot = {
   payments: Payment[];
 };
 type Attempt = { id: string; kind: string; status: 'flagged' | 'blocked' | 'failed'; detail: string; createdAt: string; hash?: `0x${string}`; scheduleId?: string };
-const paymentsAddress = process.env.NEXT_PUBLIC_RECURRING_PAYMENTS_ADDRESS;
-const tokenAddress = process.env.NEXT_PUBLIC_TEST_PAYROLL_TOKEN_ADDRESS;
-const rpcUrl = process.env.NEXT_PUBLIC_SEPOLIA_RPC_URL || sepolia.rpcUrls.default.http[0];
-const explorerUrl = (process.env.NEXT_PUBLIC_SEPOLIA_EXPLORER_URL || sepolia.blockExplorers.default.url).replace(/\/$/, '');
-const startBlock = /^\d+$/.test(process.env.NEXT_PUBLIC_GUARDIAN_DEPLOYMENT_BLOCK || '') ? BigInt(process.env.NEXT_PUBLIC_GUARDIAN_DEPLOYMENT_BLOCK!) : 0n;
 const attemptStorageKey = 'temproll-guardian-attempts-v1';
 const cadenceOptions = [{ label: 'Monthly (30 days)', seconds: 2592000 }, { label: 'Every two weeks', seconds: 1209600 }, { label: 'Weekly', seconds: 604800 }];
 const short = (address: string) => `${address.slice(0, 6)}…${address.slice(-4)}`;
@@ -54,8 +49,8 @@ function chainError(error: unknown) {
   const item = error as { code?: number; shortMessage?: string; message?: string; cause?: { code?: number; message?: string } };
   const raw = `${item?.shortMessage || ''} ${item?.message || ''} ${item?.cause?.message || ''}`.toLowerCase();
   if (item?.code === 4001 || item?.cause?.code === 4001 || raw.includes('user rejected') || raw.includes('user denied')) return 'Wallet request declined. No payment was made.';
-  if (raw.includes('insufficient funds') || raw.includes('exceeds the balance')) return 'The connected wallet needs Sepolia ETH for gas.';
-  if (raw.includes('failed to fetch') || raw.includes('http request failed') || raw.includes('timeout')) return 'Sepolia RPC is unavailable. Check the public RPC URL and try again.';
+  if (raw.includes('insufficient funds') || raw.includes('exceeds the balance')) return 'The connected wallet needs test ETH for gas.';
+  if (raw.includes('failed to fetch') || raw.includes('http request failed') || raw.includes('timeout')) return 'The selected test network RPC is unavailable. Check the public RPC URL and try again.';
   if (raw.includes('recipientnotallowed')) return 'Blocked by the on-chain employee allowlist.';
   if (raw.includes('dailylimitexceeded')) return 'Blocked by the on-chain daily spending limit.';
   if (raw.includes('limitexceeded')) return 'Blocked by the on-chain payment cap.';
@@ -66,7 +61,20 @@ function chainError(error: unknown) {
 }
 
 export default function GuardianDashboard() {
-  const publicClient = useMemo(() => createPublicClient({ chain: sepolia, transport: http(rpcUrl) }), []);
+  const [networkKey, setNetworkKey] = useState<'sepolia' | 'horizon'>('sepolia');
+  const activeChain = networkKey === 'horizon' ? horizon : sepolia;
+  const networkName = networkKey === 'horizon' ? 'Horizen Testnet' : 'Sepolia';
+  const rpcUrl = networkKey === 'horizon'
+    ? process.env.NEXT_PUBLIC_HORIZON_RPC_URL || horizon.rpcUrls.default.http[0]
+    : process.env.NEXT_PUBLIC_SEPOLIA_RPC_URL || sepolia.rpcUrls.default.http[0];
+  const explorerUrl = (networkKey === 'horizon'
+    ? process.env.NEXT_PUBLIC_HORIZON_EXPLORER_URL || horizon.blockExplorers.default.url
+    : process.env.NEXT_PUBLIC_SEPOLIA_EXPLORER_URL || sepolia.blockExplorers.default.url).replace(/\/$/, '');
+  const paymentsAddress = networkKey === 'horizon' ? process.env.NEXT_PUBLIC_HORIZON_RECURRING_PAYMENTS_ADDRESS : process.env.NEXT_PUBLIC_RECURRING_PAYMENTS_ADDRESS;
+  const tokenAddress = networkKey === 'horizon' ? process.env.NEXT_PUBLIC_HORIZON_TEST_PAYROLL_TOKEN_ADDRESS : process.env.NEXT_PUBLIC_TEST_PAYROLL_TOKEN_ADDRESS;
+  const startBlockRaw = networkKey === 'horizon' ? process.env.NEXT_PUBLIC_HORIZON_GUARDIAN_DEPLOYMENT_BLOCK : process.env.NEXT_PUBLIC_GUARDIAN_DEPLOYMENT_BLOCK;
+  const startBlock = /^\d+$/.test(startBlockRaw || '') ? BigInt(startBlockRaw!) : 0n;
+  const publicClient = useMemo(() => createPublicClient({ chain: activeChain, transport: http(rpcUrl) }), [activeChain, rpcUrl]);
   const [wallet, setWallet] = useState<`0x${string}` | null>(null);
   const [chainId, setChainId] = useState<number | null>(null);
   const [walletMessage, setWalletMessage] = useState('');
@@ -88,12 +96,12 @@ export default function GuardianDashboard() {
   const [selectedCheck, setSelectedCheck] = useState<Record<string, ReturnType<typeof explainPreflight>>>({});
 
   const guardianConfigured = !!paymentsAddress && isAddress(paymentsAddress) && !!tokenAddress && isAddress(tokenAddress);
-  const connectedToSepolia = chainId === sepolia.id;
+  const connectedToSepolia = chainId === activeChain.id;
   const isEmployer = !!snapshot?.employerAuthorized;
   const scheduleBlockReason = !wallet
-    ? 'Connect a Sepolia wallet.'
+    ? `Connect a ${networkName} wallet.`
     : !connectedToSepolia
-      ? 'Switch the wallet to Sepolia.'
+      ? `Switch the wallet to ${networkName}.`
       : !snapshot
         ? 'Waiting for contract data.'
         : !isEmployer
@@ -121,7 +129,7 @@ export default function GuardianDashboard() {
     const provider = window.ethereum;
     if (!provider) return;
     try {
-      const client = createWalletClient({ chain: sepolia, transport: custom(provider as EIP1193Provider) });
+      const client = createWalletClient({ chain: activeChain, transport: custom(provider as EIP1193Provider) });
       const [accounts, currentChain] = await Promise.all([client.getAddresses(), client.getChainId()]);
       setWallet(accounts[0] ?? null);
       setChainId(currentChain);
@@ -141,6 +149,8 @@ export default function GuardianDashboard() {
         tokenAddress: tokenAddress as `0x${string}`,
         employer: wallet,
         deploymentBlock: startBlock,
+        expectedChainId: activeChain.id,
+        networkName,
       }) as Snapshot;
       setSnapshot(data);
       if (data.policy[4]) {
@@ -154,7 +164,7 @@ export default function GuardianDashboard() {
     } finally {
       setLoading(false);
     }
-  }, [guardianConfigured, publicClient, wallet]);
+  }, [activeChain.id, guardianConfigured, networkName, publicClient, wallet]);
 
   useEffect(() => {
     try {
@@ -188,7 +198,7 @@ export default function GuardianDashboard() {
     const provider = window.ethereum;
     if (!provider) { setWalletMessage('MetaMask was not found.'); return; }
     try {
-      const client = createWalletClient({ chain: sepolia, transport: custom(provider as EIP1193Provider) });
+      const client = createWalletClient({ chain: activeChain, transport: custom(provider as EIP1193Provider) });
       const accounts = await client.requestAddresses();
       setWallet(accounts[0] ?? null);
       setChainId(await client.getChainId());
@@ -208,7 +218,7 @@ export default function GuardianDashboard() {
     const provider = window.ethereum;
     if (!provider) return;
     try {
-      await switchToSepolia(provider, rpcUrl, explorerUrl);
+      await switchToNetwork(provider, activeChain, rpcUrl, explorerUrl);
       await readWallet();
     } catch (error) { setWalletMessage(chainError(error)); }
   }
@@ -221,8 +231,8 @@ export default function GuardianDashboard() {
     try {
       const provider = window.ethereum;
       if (!provider) throw new Error('MetaMask was not found.');
-      const client = createWalletClient({ chain: sepolia, transport: custom(provider as EIP1193Provider) });
-      if (await client.getChainId() !== sepolia.id) throw new Error('Wallet is not on Sepolia.');
+      const client = createWalletClient({ chain: activeChain, transport: custom(provider as EIP1193Provider) });
+      if (await client.getChainId() !== activeChain.id) throw new Error('Wallet is not on Sepolia.');
       hash = await client.writeContract({ account: wallet, address: paymentsAddress as `0x${string}`, abi: guardianAbi, functionName: functionName as never, args: args as never });
       const receipt = await publicClient.waitForTransactionReceipt({ hash });
       if (receipt.status !== 'success') throw new Error('Transaction reverted on Sepolia.');
@@ -269,7 +279,7 @@ export default function GuardianDashboard() {
       setBusy(action === 'mint' ? 'Minting test tokens' : 'Approving test-token deposit');
       const provider = window.ethereum;
       if (!provider) throw new Error('MetaMask was not found.');
-      const client = createWalletClient({ chain: sepolia, transport: custom(provider as EIP1193Provider) });
+      const client = createWalletClient({ chain: activeChain, transport: custom(provider as EIP1193Provider) });
       let hash: `0x${string}`;
       if (action === 'mint') {
         hash = await client.writeContract({ account: wallet, address: tokenAddress as `0x${string}`, abi: demoTokenAbi, functionName: 'mint', args: [wallet, value] });
@@ -312,7 +322,7 @@ export default function GuardianDashboard() {
       setBusy('Creating schedule');
       const provider = window.ethereum;
       if (!provider || !wallet || !connectedToSepolia) throw new Error('Connect the employer wallet on Sepolia.');
-      const client = createWalletClient({ chain: sepolia, transport: custom(provider as EIP1193Provider) });
+      const client = createWalletClient({ chain: activeChain, transport: custom(provider as EIP1193Provider) });
       const firstDue = BigInt(Math.floor(Date.now() / 1000) + 120);
       const hash = await client.writeContract({ account: wallet, address: paymentsAddress as `0x${string}`, abi: guardianAbi, functionName: 'createSchedule', args: [recipient, tokenAddress, value, value, firstDue, BigInt(cadence), 0n] });
       const receipt = await publicClient.waitForTransactionReceipt({ hash });
@@ -359,7 +369,7 @@ export default function GuardianDashboard() {
       await publicClient.simulateContract({ account: wallet, address: paymentsAddress as `0x${string}`, abi: guardianAbi, functionName: 'execute', args: [BigInt(schedule.id)] });
       const provider = window.ethereum;
       if (!provider) throw new Error('MetaMask was not found.');
-      const client = createWalletClient({ chain: sepolia, transport: custom(provider as EIP1193Provider) });
+      const client = createWalletClient({ chain: activeChain, transport: custom(provider as EIP1193Provider) });
       hash = await client.writeContract({ account: wallet, address: paymentsAddress as `0x${string}`, abi: guardianAbi, functionName: 'execute', args: [BigInt(schedule.id)] });
       const receipt = await publicClient.waitForTransactionReceipt({ hash });
       if (receipt.status !== 'success') throw new Error('Execution transaction reverted on Sepolia.');
@@ -381,24 +391,25 @@ export default function GuardianDashboard() {
   const payments = snapshot?.payments.filter((payment) => scheduleIds.has(payment.id)) || [];
   const confirmedPaymentHashes = new Set(payments.map((payment) => payment.hash.toLowerCase()));
   const latestHistory = [
-    ...payments.map((payment) => ({ source: 'Sepolia', title: `Schedule #${payment.id} · installment ${payment.installment + 1}`, detail: `${formatAmount(payment.amount, snapshot?.decimals)} TROLL · ${short(payment.recipient)}`, hash: payment.hash, sort: Number(payment.blockNumber), type: 'onchain' })),
+    ...payments.map((payment) => ({ source: networkName, title: `Schedule #${payment.id} · installment ${payment.installment + 1}`, detail: `${formatAmount(payment.amount, snapshot?.decimals)} TROLL · ${short(payment.recipient)}`, hash: payment.hash, sort: Number(payment.blockNumber), type: 'onchain' })),
     ...attempts
       .filter((attempt) => !(attempt.kind === 'Payment executed' && attempt.hash && confirmedPaymentHashes.has(attempt.hash.toLowerCase())))
-      .map((attempt) => ({ source: attempt.hash ? 'Sepolia tx' : 'Local', title: attempt.kind, detail: attempt.detail, hash: attempt.hash, sort: new Date(attempt.createdAt).getTime(), type: 'local' })),
+      .map((attempt) => ({ source: attempt.hash ? `${networkName} tx` : 'Local', title: attempt.kind, detail: attempt.detail, hash: attempt.hash, sort: new Date(attempt.createdAt).getTime(), type: 'local' })),
   ].sort((a, b) => b.sort - a.sort).slice(0, 8);
 
   return <main className="app-shell">
     <header className="app-header">
       <Link className="app-brand" href="/"><Image src="/temproll-mark.svg" alt="" width={28} height={28} />Temproll</Link>
       <div className="app-header-right">
-        {wallet ? <div className={`wallet-label${chainId === sepolia.id ? '' : ' mismatch'}`}><span>{chainId === sepolia.id ? 'Sepolia' : chainId === 1 ? 'Ethereum Mainnet' : `Chain ${chainId}`} · {short(wallet)}</span>{chainId !== sepolia.id && <button onClick={() => void switchNetwork()}>Switch to Sepolia</button>}<button className="button" onClick={disconnectWallet}>Disconnect</button></div> : <button className="button button-primary" onClick={() => void connectWallet()}>Connect wallet</button>}
+        <label className="network-switcher"><span className="network-switcher-label">Network</span><span className="network-select-wrap"><select aria-label="Select network" value={networkKey} onChange={(event) => { setNetworkKey(event.target.value as 'sepolia' | 'horizon'); setSnapshot(null); setLoadMessage(''); }}><option value="sepolia">Sepolia</option><option value="horizon">Horizen Testnet</option></select></span></label>
+        {wallet ? <div className={`wallet-label${chainId === activeChain.id ? '' : ' mismatch'}`}><span>{chainId === activeChain.id ? networkName : chainId === 1 ? 'Ethereum Mainnet' : `Chain ${chainId}`} · {short(wallet)}</span>{chainId !== activeChain.id && <button onClick={() => void switchNetwork()}>Switch to {networkName}</button>}<button className="button" onClick={disconnectWallet}>Disconnect</button></div> : <button className="button button-primary" onClick={() => void connectWallet()}>Connect wallet</button>}
       </div>
     </header>
     <div className="app-content guardian-content">
       {walletMessage && <p className="notice" role="status">{walletMessage}</p>}
       <div className="guardian-title"><div><h1>Payroll</h1></div><button className="button" onClick={() => void refresh()} disabled={!canRefreshGuardian({ loading, hasWallet: !!wallet, configured: guardianConfigured })}>{loading ? 'Refreshing...' : 'Refresh'}</button></div>
 
-      {!guardianConfigured && <div className="notice" role="status">Sepolia payment contracts are not configured.</div>}
+      {!guardianConfigured && <div className="notice" role="status">{networkName} payment contracts are not configured.</div>}
       {loadMessage && <p className="action-message" role="status">{loadMessage}</p>}
 
       {guardianConfigured && <>
@@ -460,11 +471,12 @@ export default function GuardianDashboard() {
 
       <section className="guardian-section">
         <div className="section-title"><h2>Activity</h2><span>{payments.length} confirmed payments</span></div>
-        {latestHistory.length === 0 ? <p className="empty-state">No activity yet.</p> : <div className="activity-list">{latestHistory.map((item, index) => <div className="activity-row" key={`${item.type}-${item.hash || item.sort}-${index}`}><div><strong>{item.title}</strong><span>{item.detail}</span></div><small>{item.source}</small>{item.hash && <a href={`${explorerUrl}/tx/${item.hash}`} target="_blank" rel="noreferrer">Etherscan ↗</a>}</div>)}</div>}
-        <p className="footnote">Sepolia transactions are public. Checks without a transaction are saved in this browser.</p>
+        {latestHistory.length === 0 ? <p className="empty-state">No activity yet.</p> : <div className="activity-list">{latestHistory.map((item, index) => <div className="activity-row" key={`${item.type}-${item.hash || item.sort}-${index}`}><div><strong>{item.title}</strong><span>{item.detail}</span></div><small>{item.source}</small>{item.hash && <a href={`${explorerUrl}/tx/${item.hash}`} target="_blank" rel="noreferrer">Explorer ↗</a>}</div>)}</div>}
+        <p className="footnote">{networkName} transactions are public. Checks without a transaction are saved in this browser.</p>
       </section>
 
       </>}
     </div>
   </main>;
 }
+
