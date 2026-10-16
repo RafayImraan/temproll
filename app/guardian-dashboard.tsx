@@ -35,7 +35,7 @@ type Snapshot = {
   schedules: Schedule[];
   payments: Payment[];
 };
-type Attempt = { id: string; kind: string; status: 'flagged' | 'blocked' | 'failed'; detail: string; createdAt: string; hash?: `0x${string}`; scheduleId?: string };
+type Attempt = { id: string; kind: string; status: 'flagged' | 'blocked' | 'failed'; detail: string; createdAt: string; hash?: `0x${string}`; scheduleId?: string; networkKey?: 'sepolia' | 'horizon' };
 const attemptStorageKey = 'temproll-guardian-attempts-v1';
 const cadenceOptions = [{ label: 'Monthly (30 days)', seconds: 2592000 }, { label: 'Every two weeks', seconds: 1209600 }, { label: 'Weekly', seconds: 604800 }];
 const short = (address: string) => `${address.slice(0, 6)}…${address.slice(-4)}`;
@@ -45,11 +45,11 @@ function parseGuardianLogs<TArgs>(eventName: 'ScheduleCreated' | 'PaymentApprove
   return parseEventLogs({ abi: guardianAbi, eventName, logs: logs as never, strict: true }) as unknown as Array<{ args: TArgs }>;
 }
 
-function chainError(error: unknown) {
+function chainError(error: unknown, networkName = 'test network') {
   const item = error as { code?: number; shortMessage?: string; message?: string; cause?: { code?: number; message?: string } };
   const raw = `${item?.shortMessage || ''} ${item?.message || ''} ${item?.cause?.message || ''}`.toLowerCase();
   if (item?.code === 4001 || item?.cause?.code === 4001 || raw.includes('user rejected') || raw.includes('user denied')) return 'Wallet request declined. No payment was made.';
-  if (raw.includes('insufficient funds') || raw.includes('exceeds the balance')) return 'The connected wallet needs test ETH for gas.';
+  if (raw.includes('insufficient funds') || raw.includes('exceeds the balance')) return `The connected wallet needs ${networkName} test ETH for gas.`;
   if (raw.includes('failed to fetch') || raw.includes('http request failed') || raw.includes('timeout')) return 'The selected test network RPC is unavailable. Check the public RPC URL and try again.';
   if (raw.includes('recipientnotallowed')) return 'Blocked by the on-chain employee allowlist.';
   if (raw.includes('dailylimitexceeded')) return 'Blocked by the on-chain daily spending limit.';
@@ -96,11 +96,11 @@ export default function GuardianDashboard() {
   const [selectedCheck, setSelectedCheck] = useState<Record<string, ReturnType<typeof explainPreflight>>>({});
 
   const guardianConfigured = !!paymentsAddress && isAddress(paymentsAddress) && !!tokenAddress && isAddress(tokenAddress);
-  const connectedToSepolia = chainId === activeChain.id;
+  const connectedToSelectedNetwork = chainId === activeChain.id;
   const isEmployer = !!snapshot?.employerAuthorized;
   const scheduleBlockReason = !wallet
     ? `Connect a ${networkName} wallet.`
-    : !connectedToSepolia
+    : !connectedToSelectedNetwork
       ? `Switch the wallet to ${networkName}.`
       : !snapshot
         ? 'Waiting for contract data.'
@@ -116,14 +116,14 @@ export default function GuardianDashboard() {
                   ? `${busy}...`
                   : '';
 
-  const recordAttempt = useCallback((entry: Omit<Attempt, 'id' | 'createdAt'>) => {
-    const record: Attempt = { ...entry, id: crypto.randomUUID(), createdAt: new Date().toISOString() };
+  const recordAttempt = useCallback((entry: Omit<Attempt, 'id' | 'createdAt' | 'networkKey'>) => {
+    const record: Attempt = { ...entry, networkKey, id: crypto.randomUUID(), createdAt: new Date().toISOString() };
     setAttempts((current) => {
-      const next = [record, ...current].slice(0, 50);
-      try { localStorage.setItem(attemptStorageKey, JSON.stringify(next)); } catch { /* Local audit history is optional when storage is unavailable. */ }
+      const next = [record, ...current.filter((attempt) => attempt.networkKey === networkKey)].slice(0, 50);
+      try { localStorage.setItem(`${attemptStorageKey}-${networkKey}`, JSON.stringify(next)); } catch { /* Local audit history is optional when storage is unavailable. */ }
       return next;
     });
-  }, []);
+  }, [networkKey]);
 
   const readWallet = useCallback(async () => {
     const provider = window.ethereum;
@@ -160,7 +160,7 @@ export default function GuardianDashboard() {
         setRecipientCooldown(String(data.policy[3]));
       }
     } catch (error) {
-      setLoadMessage(chainError(error));
+      setLoadMessage(chainError(error, networkName));
     } finally {
       setLoading(false);
     }
@@ -168,8 +168,8 @@ export default function GuardianDashboard() {
 
   useEffect(() => {
     try {
-      const stored = JSON.parse(localStorage.getItem(attemptStorageKey) || '[]');
-      if (Array.isArray(stored)) setAttempts(stored.filter((entry) => entry && typeof entry.detail === 'string').slice(0, 50));
+      const stored = JSON.parse(localStorage.getItem(`${attemptStorageKey}-${networkKey}`) || '[]');
+      if (Array.isArray(stored)) setAttempts(stored.filter((entry) => entry && typeof entry.detail === 'string').map((entry) => ({ ...entry, networkKey } as Attempt)).slice(0, 50));
     } catch { setAttempts([]); }
     const provider = window.ethereum;
     if (!provider) return;
@@ -180,7 +180,7 @@ export default function GuardianDashboard() {
       provider.removeListener?.('chainChanged', update);
       provider.removeListener?.('accountsChanged', update);
     };
-  }, [readWallet, wallet]);
+  }, [networkKey, readWallet, wallet]);
 
   useEffect(() => { void refresh(); }, [refresh]);
 
@@ -203,7 +203,7 @@ export default function GuardianDashboard() {
       setWallet(accounts[0] ?? null);
       setChainId(await client.getChainId());
       setWalletMessage('');
-    } catch (error) { setWalletMessage(chainError(error)); }
+    } catch (error) { setWalletMessage(chainError(error, networkName)); }
   }
 
   function disconnectWallet() {
@@ -220,27 +220,27 @@ export default function GuardianDashboard() {
     try {
       await switchToNetwork(provider, activeChain, rpcUrl, explorerUrl);
       await readWallet();
-    } catch (error) { setWalletMessage(chainError(error)); }
+    } catch (error) { setWalletMessage(chainError(error, networkName)); }
   }
 
   async function sendGuardianCall(label: string, functionName: string, args: readonly unknown[]) {
-    if (!wallet || !connectedToSepolia) throw new Error('Connect the employer wallet on Sepolia first.');
-    if (!guardianConfigured) throw new Error('Sepolia payment contracts are not configured.');
+    if (!wallet || !connectedToSelectedNetwork) throw new Error(`Connect the employer wallet on ${networkName} first.`);
+    if (!guardianConfigured) throw new Error(`${networkName} payment contracts are not configured.`);
     setBusy(label);
     let hash: `0x${string}` | undefined;
     try {
       const provider = window.ethereum;
       if (!provider) throw new Error('MetaMask was not found.');
       const client = createWalletClient({ chain: activeChain, transport: custom(provider as EIP1193Provider) });
-      if (await client.getChainId() !== activeChain.id) throw new Error('Wallet is not on Sepolia.');
+      if (await client.getChainId() !== activeChain.id) throw new Error(`Wallet is not on ${networkName}.`);
       hash = await client.writeContract({ account: wallet, address: paymentsAddress as `0x${string}`, abi: guardianAbi, functionName: functionName as never, args: args as never });
       const receipt = await publicClient.waitForTransactionReceipt({ hash });
-      if (receipt.status !== 'success') throw new Error('Transaction reverted on Sepolia.');
-      recordAttempt({ kind: label, status: 'flagged', detail: `${label} confirmed on Sepolia.`, hash });
+      if (receipt.status !== 'success') throw new Error(`Transaction reverted on ${networkName}.`);
+      recordAttempt({ kind: label, status: 'flagged', detail: `${label} confirmed on ${networkName}.`, hash });
       await refresh();
       return { hash, receipt };
     } catch (error) {
-      const message = chainError(error);
+      const message = chainError(error, networkName);
       recordAttempt({ kind: label, status: 'failed', detail: message, hash });
       setLoadMessage(message);
       throw error;
@@ -266,13 +266,13 @@ export default function GuardianDashboard() {
       const { hash } = await sendGuardianCall(allowed ? 'Employee allowed' : 'Employee removed', 'setRecipientAllowed', [recipient, allowed]);
       const current = await publicClient.readContract({ address: paymentsAddress as `0x${string}`, abi: guardianAbi, functionName: 'approvedRecipients', args: [wallet!, recipient as `0x${string}`] });
       setRecipientAllowed(Boolean(current));
-      setLoadMessage(`${allowed ? 'Employee allowed' : 'Employee access removed'} on Sepolia. ${short(hash)}.`);
+      setLoadMessage(`${allowed ? 'Employee allowed' : 'Employee access removed'} on ${networkName}. ${short(hash)}.`);
     } catch { /* Error is already shown by sendGuardianCall. */ }
   }
 
   async function tokenAction(action: 'mint' | 'fund', event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!wallet || !connectedToSepolia || !snapshot || !isEmployer) { setLoadMessage('Connect and register this wallet on Sepolia first.'); return; }
+    if (!wallet || !connectedToSelectedNetwork || !snapshot || !isEmployer) { setLoadMessage(`Connect and register this wallet on ${networkName} first.`); return; }
     try {
       const value = parseUnits(action === 'mint' ? mintAmount : fundAmount, snapshot.decimals);
       if (value <= 0n) throw new Error('Enter a positive token amount.');
@@ -284,21 +284,21 @@ export default function GuardianDashboard() {
       if (action === 'mint') {
         hash = await client.writeContract({ account: wallet, address: tokenAddress as `0x${string}`, abi: demoTokenAbi, functionName: 'mint', args: [wallet, value] });
         const receipt = await publicClient.waitForTransactionReceipt({ hash });
-        if (receipt.status !== 'success') throw new Error('Token mint reverted on Sepolia.');
+        if (receipt.status !== 'success') throw new Error(`Token mint reverted on ${networkName}.`);
       } else {
         hash = await client.writeContract({ account: wallet, address: tokenAddress as `0x${string}`, abi: demoTokenAbi, functionName: 'approve', args: [paymentsAddress as `0x${string}`, value] });
         const approvalReceipt = await publicClient.waitForTransactionReceipt({ hash });
-        if (approvalReceipt.status !== 'success') throw new Error('Token approval reverted on Sepolia.');
+        if (approvalReceipt.status !== 'success') throw new Error(`Token approval reverted on ${networkName}.`);
         setBusy('Funding employer balance');
         hash = await client.writeContract({ account: wallet, address: paymentsAddress as `0x${string}`, abi: guardianAbi, functionName: 'deposit', args: [tokenAddress as `0x${string}`, value] });
         const receipt = await publicClient.waitForTransactionReceipt({ hash });
-        if (receipt.status !== 'success') throw new Error('Employer funding reverted on Sepolia.');
+        if (receipt.status !== 'success') throw new Error(`Employer funding reverted on ${networkName}.`);
       }
-      recordAttempt({ kind: action === 'mint' ? 'Test tokens minted' : 'Employer balance funded', status: 'flagged', detail: `${formatAmount(value, snapshot.decimals)} TROLL · Sepolia confirmed.`, hash });
+      recordAttempt({ kind: action === 'mint' ? 'Test tokens minted' : 'Employer balance funded', status: 'flagged', detail: `${formatAmount(value, snapshot.decimals)} TROLL · ${networkName} confirmed.`, hash });
       setLoadMessage(`${action === 'mint' ? 'Test tokens minted' : 'Employer balance funded'}: ${short(hash)}.`);
       await refresh();
     } catch (error) {
-      const message = chainError(error);
+      const message = chainError(error, networkName);
       recordAttempt({ kind: action === 'mint' ? 'Mint failed' : 'Funding failed', status: 'failed', detail: message });
       setLoadMessage(message);
     } finally { setBusy(''); }
@@ -321,7 +321,7 @@ export default function GuardianDashboard() {
       if (value <= 0n || value > snapshot.policy[0]) throw new Error('Payment must be positive and no higher than the configured cap.');
       setBusy('Creating schedule');
       const provider = window.ethereum;
-      if (!provider || !wallet || !connectedToSepolia) throw new Error('Connect the employer wallet on Sepolia.');
+      if (!provider || !wallet || !connectedToSelectedNetwork) throw new Error(`Connect the employer wallet on ${networkName}.`);
       const client = createWalletClient({ chain: activeChain, transport: custom(provider as EIP1193Provider) });
       const firstDue = BigInt(Math.floor(Date.now() / 1000) + 120);
       const hash = await client.writeContract({ account: wallet, address: paymentsAddress as `0x${string}`, abi: guardianAbi, functionName: 'createSchedule', args: [recipient, tokenAddress, value, value, firstDue, BigInt(cadence), 0n] });
@@ -329,11 +329,11 @@ export default function GuardianDashboard() {
       if (receipt.status !== 'success') throw new Error('Schedule transaction reverted.');
       const event = parseGuardianLogs<{ id: bigint; owner: `0x${string}`; recipient: `0x${string}`; amount: bigint }>('ScheduleCreated', receipt.logs).find((log) => log.args.owner.toLowerCase() === wallet.toLowerCase() && log.args.recipient.toLowerCase() === recipient.toLowerCase() && log.args.amount === value);
       if (!event) throw new Error('Schedule receipt did not contain the expected ScheduleCreated event.');
-      recordAttempt({ kind: 'Schedule created', status: 'flagged', detail: `Schedule #${event.args.id} registered on Sepolia.`, hash, scheduleId: event.args.id.toString() });
+      recordAttempt({ kind: 'Schedule created', status: 'flagged', detail: `Schedule #${event.args.id} registered on ${networkName}.`, hash, scheduleId: event.args.id.toString() });
       setLoadMessage(`Schedule #${event.args.id} created. First installment is due in about two minutes.`);
       await refresh();
     } catch (error) {
-      const message = chainError(error);
+      const message = chainError(error, networkName);
       recordAttempt({ kind: 'Schedule creation failed', status: 'failed', detail: message });
       setLoadMessage(message);
     } finally { setBusy(''); }
@@ -347,7 +347,7 @@ export default function GuardianDashboard() {
       const status = assessment.action === 'BLOCK' ? 'blocked' : assessment.level === 'MEDIUM' || assessment.action === 'REQUIRE_APPROVAL' ? 'flagged' : 'flagged';
       recordAttempt({ kind: 'Security check', status, detail: `${assessment.level} risk · ${assessment.action}${assessment.reasons.length ? ` · ${assessment.reasons.join(' ')}` : ' · No policy flags.'}`, scheduleId: schedule.id });
       setLoadMessage('Security check read current contract state. No transaction was sent.');
-    } catch (error) { setLoadMessage(chainError(error)); }
+    } catch (error) { setLoadMessage(chainError(error, networkName)); }
   }
 
   async function approvePayment(schedule: Schedule) {
@@ -357,11 +357,11 @@ export default function GuardianDashboard() {
       if (!approved) throw new Error('Approval receipt did not match this schedule installment.');
       setLoadMessage(`Approval recorded for schedule #${schedule.id}, installment ${schedule.executions}. ${short(hash)}.`);
       await refresh();
-    } catch (error) { setLoadMessage(chainError(error)); }
+    } catch (error) { setLoadMessage(chainError(error, networkName)); }
   }
 
   async function executePayment(schedule: Schedule) {
-    if (!wallet || !connectedToSepolia) { setLoadMessage('Connect a wallet on Sepolia.'); return; }
+    if (!wallet || !connectedToSelectedNetwork) { setLoadMessage(`Connect a wallet on ${networkName}.`); return; }
     setBusy(`Executing schedule ${schedule.id}`);
     let hash: `0x${string}` | undefined;
     try {
@@ -372,16 +372,16 @@ export default function GuardianDashboard() {
       const client = createWalletClient({ chain: activeChain, transport: custom(provider as EIP1193Provider) });
       hash = await client.writeContract({ account: wallet, address: paymentsAddress as `0x${string}`, abi: guardianAbi, functionName: 'execute', args: [BigInt(schedule.id)] });
       const receipt = await publicClient.waitForTransactionReceipt({ hash });
-      if (receipt.status !== 'success') throw new Error('Execution transaction reverted on Sepolia.');
+      if (receipt.status !== 'success') throw new Error(`Execution transaction reverted on ${networkName}.`);
       const event = parseGuardianLogs<{ id: bigint; execution: number; recipient: `0x${string}`; token: `0x${string}`; amount: bigint }>('PaymentExecuted', receipt.logs).find((log) => log.args.id === BigInt(schedule.id) && log.args.execution === schedule.executions && log.args.recipient.toLowerCase() === schedule.recipient.toLowerCase() && log.args.token.toLowerCase() === tokenAddress?.toLowerCase() && log.args.amount === schedule.amount);
       if (!event) throw new Error('Receipt did not contain the expected PaymentExecuted event.');
       const after = await publicClient.readContract({ address: tokenAddress as `0x${string}`, abi: demoTokenAbi, functionName: 'balanceOf', args: [schedule.recipient] }) as bigint;
       if (after - before !== schedule.amount) throw new Error('Payment event was found, but recipient token balance did not increase by the scheduled amount.');
-      recordAttempt({ kind: 'Payment executed', status: 'flagged', detail: `Sepolia verified · ${formatAmount(schedule.amount, snapshot?.decimals)} TROLL paid to ${short(schedule.recipient)}.`, hash, scheduleId: schedule.id });
+      recordAttempt({ kind: 'Payment executed', status: 'flagged', detail: `${networkName} verified · ${formatAmount(schedule.amount, snapshot?.decimals)} TROLL paid to ${short(schedule.recipient)}.`, hash, scheduleId: schedule.id });
       setLoadMessage(`Payment verified in block ${receipt.blockNumber}. ${short(hash)}.`);
       await refresh();
     } catch (error) {
-      const message = chainError(error);
+      const message = chainError(error, networkName);
       recordAttempt({ kind: 'Payment blocked or failed', status: classifyPaymentFailure(error), detail: message, hash, scheduleId: schedule.id });
       setLoadMessage(message);
     } finally { setBusy(''); }
@@ -393,6 +393,7 @@ export default function GuardianDashboard() {
   const latestHistory = [
     ...payments.map((payment) => ({ source: networkName, title: `Schedule #${payment.id} · installment ${payment.installment + 1}`, detail: `${formatAmount(payment.amount, snapshot?.decimals)} TROLL · ${short(payment.recipient)}`, hash: payment.hash, sort: Number(payment.blockNumber), type: 'onchain' })),
     ...attempts
+      .filter((attempt) => attempt.networkKey === networkKey)
       .filter((attempt) => !(attempt.kind === 'Payment executed' && attempt.hash && confirmedPaymentHashes.has(attempt.hash.toLowerCase())))
       .map((attempt) => ({ source: attempt.hash ? `${networkName} tx` : 'Local', title: attempt.kind, detail: attempt.detail, hash: attempt.hash, sort: new Date(attempt.createdAt).getTime(), type: 'local' })),
   ].sort((a, b) => b.sort - a.sort).slice(0, 8);
@@ -413,15 +414,15 @@ export default function GuardianDashboard() {
       {loadMessage && <p className="action-message" role="status">{loadMessage}</p>}
 
       {guardianConfigured && <>
-      {wallet && connectedToSepolia && snapshot && !snapshot.employerAuthorized && <section className="guardian-section"><p>Set up this wallet as its own employer.</p><button className="button button-primary" onClick={() => void registerEmployer()} disabled={!!busy}>{busy === 'Employer registration' ? 'Registering...' : 'Register employer'}</button></section>}
+      {wallet && connectedToSelectedNetwork && snapshot && !snapshot.employerAuthorized && <section className="guardian-section"><p>Set up this wallet as its own employer.</p><button className="button button-primary" onClick={() => void registerEmployer()} disabled={!!busy}>{busy === 'Employer registration' ? 'Registering...' : 'Register employer'}</button></section>}
       <section className="guardian-section">
-        <div className="section-title"><h2>Policy</h2><span>{snapshot?.policy[4] ? 'Configured on Sepolia' : 'Not configured'}</span></div>
+        <div className="section-title"><h2>Policy</h2><span>{snapshot?.policy[4] ? `Configured on ${networkName}` : 'Not configured'}</span></div>
         <form className="policy-form" onSubmit={configurePolicy}>
           <label>Max per payment <span>TROLL</span><input type="number" min="0.000000000000000001" step="any" value={maxPerPayment} onChange={(e) => setMaxPerPayment(e.target.value)} /></label>
           <label>Daily limit <span>TROLL</span><input type="number" min="0.000000000000000001" step="any" value={dailyLimit} onChange={(e) => setDailyLimit(e.target.value)} /></label>
           <label>Approval threshold <span>TROLL; 0 disables</span><input type="number" min="0" step="any" value={approvalThreshold} onChange={(e) => setApprovalThreshold(e.target.value)} /></label>
           <label>Recipient cooldown <span>seconds</span><input type="number" min="0" step="1" value={recipientCooldown} onChange={(e) => setRecipientCooldown(e.target.value)} /></label>
-          <button className="button button-primary" type="submit" disabled={!isEmployer || !connectedToSepolia || !!busy}>{busy === 'Policy update' ? 'Saving…' : 'Save policy'}</button>
+          <button className="button button-primary" type="submit" disabled={!isEmployer || !connectedToSelectedNetwork || !!busy}>{busy === 'Policy update' ? 'Saving…' : 'Save policy'}</button>
         </form>
         {snapshot && <p className="balance-line">Wallet: {formatAmount(snapshot.walletTokenBalance, snapshot.decimals)} TROLL <span>·</span> Your payroll balance: {formatAmount(snapshot.employerFunds, snapshot.decimals)} TROLL</p>}
       </section>
@@ -433,9 +434,9 @@ export default function GuardianDashboard() {
           <label>Amount <span>TROLL</span><input type="number" min="0.000000000000000001" step="any" value={amount} onChange={(e) => setAmount(e.target.value)} required /></label>
           <label>Frequency<select value={cadence} onChange={(e) => setCadence(Number(e.target.value))}>{cadenceOptions.map((option) => <option value={option.seconds} key={option.seconds}>{option.label}</option>)}</select></label>
           <div className="schedule-access">
-            <button className="button" type="button" onClick={() => void changeRecipientAccess(true)} disabled={!isEmployer || !connectedToSepolia || !!busy || !isAddress(recipient)}>Allow recipient</button>
-            <button className="button button-danger" type="button" onClick={() => void changeRecipientAccess(false)} disabled={!isEmployer || !connectedToSepolia || !!busy || !isAddress(recipient)}>Remove access</button>
-            <span>{recipientAllowed === true ? 'Allowed on Sepolia' : recipientAllowed === false ? 'Not allowed' : isAddress(recipient) ? 'Checking access...' : 'Enter a recipient'}</span>
+            <button className="button" type="button" onClick={() => void changeRecipientAccess(true)} disabled={!isEmployer || !connectedToSelectedNetwork || !!busy || !isAddress(recipient)}>Allow recipient</button>
+            <button className="button button-danger" type="button" onClick={() => void changeRecipientAccess(false)} disabled={!isEmployer || !connectedToSelectedNetwork || !!busy || !isAddress(recipient)}>Remove access</button>
+            <span>{recipientAllowed === true ? `Allowed on ${networkName}` : recipientAllowed === false ? 'Not allowed' : isAddress(recipient) ? 'Checking access...' : 'Enter a recipient'}</span>
           </div>
           <button className="button button-primary" type="submit" disabled={!!scheduleBlockReason}>{busy === 'Creating schedule' ? 'Creating...' : 'Create schedule'}</button>
         </form>
@@ -444,10 +445,10 @@ export default function GuardianDashboard() {
       </section>
 
       <section className="guardian-section">
-        <div className="section-title"><h2>TROLL token</h2><span>No monetary value · Sepolia</span></div>
+        <div className="section-title"><h2>TROLL token</h2><span>No monetary value · {networkName}</span></div>
         <div className="token-actions">
-          <form onSubmit={(e) => void tokenAction('mint', e)}><label>Mint to wallet<input type="number" min="0.000000000000000001" step="any" value={mintAmount} onChange={(e) => setMintAmount(e.target.value)} /></label><button className="button" disabled={!isEmployer || !connectedToSepolia || !!busy}>{busy === 'Minting test tokens' ? 'Minting...' : 'Mint test tokens'}</button></form>
-          <form onSubmit={(e) => void tokenAction('fund', e)}><label>Fund your payroll balance<input type="number" min="0.000000000000000001" step="any" value={fundAmount} onChange={(e) => setFundAmount(e.target.value)} /></label><button className="button" disabled={!isEmployer || !connectedToSepolia || !!busy}>{busy.includes('Funding') || busy.includes('Approving') ? 'Funding...' : 'Fund'}</button></form>
+          <form onSubmit={(e) => void tokenAction('mint', e)}><label>Mint to wallet<input type="number" min="0.000000000000000001" step="any" value={mintAmount} onChange={(e) => setMintAmount(e.target.value)} /></label><button className="button" disabled={!isEmployer || !connectedToSelectedNetwork || !!busy}>{busy === 'Minting test tokens' ? 'Minting...' : 'Mint test tokens'}</button></form>
+          <form onSubmit={(e) => void tokenAction('fund', e)}><label>Fund your payroll balance<input type="number" min="0.000000000000000001" step="any" value={fundAmount} onChange={(e) => setFundAmount(e.target.value)} /></label><button className="button" disabled={!isEmployer || !connectedToSelectedNetwork || !!busy}>{busy.includes('Funding') || busy.includes('Approving') ? 'Funding...' : 'Fund'}</button></form>
         </div>
       </section>
 
@@ -463,7 +464,7 @@ export default function GuardianDashboard() {
             <div className="payment-bottom"><span>{schedule.active ? `Due ${new Date(Number(schedule.nextDue) * 1000).toLocaleString()}` : 'Inactive'} · installment {schedule.executions + 1}</span><div>
               <button className="text-button" onClick={() => void runSecurityCheck(schedule)} disabled={!!busy}>Check rules</button>
               {assessment.action === 'REQUIRE_APPROVAL' && isEmployer && <button className="text-button" onClick={() => void approvePayment(schedule)} disabled={!!busy}>Approve</button>}
-              {assessment.action === 'ALLOW' && <button className="text-button" onClick={() => void executePayment(schedule)} disabled={!connectedToSepolia || !!busy}>Execute payment</button>}
+              {assessment.action === 'ALLOW' && <button className="text-button" onClick={() => void executePayment(schedule)} disabled={!connectedToSelectedNetwork || !!busy}>Execute payment</button>}
             </div></div>
           </article>;
         })}</div>
